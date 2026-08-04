@@ -1,0 +1,56 @@
+name: Build fan target
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - "main.c"
+      - "Makefile"
+      - ".github/workflows/build.yml"
+  pull_request:
+    paths:
+      - "main.c"
+      - "Makefile"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout payload
+        uses: actions/checkout@v4
+
+      - name: Checkout PS5 Payload SDK
+        uses: actions/checkout@v4
+        with:
+          repository: ps5-payload-dev/sdk
+          path: sdk
+
+      - name: Install PS5 Payload SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18
+          make -C sdk DESTDIR="${{ runner.tool_cache }}/ps5-payload-sdk" clean install
+          echo "PS5_PAYLOAD_SDK=${{ runner.tool_cache }}/ps5-payload-sdk" >> "$GITHUB_ENV"
+
+      - name: Build all temperature variants
+        run: make clean all
+
+      - name: Verify outputs
+        run: |
+          test "$(find dist -maxdepth 1 -type f -name 'fan_target_*c.elf' | wc -l)" -eq 5
+          cd dist
+          sha256sum -c SHA256SUMS.txt
+
+      - name: Upload payloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: fan-target
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
