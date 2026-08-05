@@ -82,7 +82,7 @@ make clean all CFLAGS="-std=c11 -Wall -Wextra -Werror -O2 -DFANTARGET_IDLE_ENTER
 
 ## Start automatically
 
-With **PLK Autoloader**, copy `fan_target.elf` into the payload directory and add to `autoload.txt`:
+With **Any Autoloader**, copy `fan_target.elf` into the payload directory and add to `autoload.txt`:
 
 ```ini
 !100
