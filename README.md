@@ -1,81 +1,105 @@
-# PS5 Fan Target
+# PS5 Fan Target (dynamic / idle-aware fork)
 
-`fan_target` keeps the PS5 fan controller at a selected target temperature while
-leaving the console's automatic fan control enabled.
+Fork of [drakmor/fan_target](https://github.com/drakmor/fan_target) with:
 
-Five ready-to-build versions are included:
+1. **Idle detection + 3 °C hysteresis** – 15-minute average temperature  
+   - enter idle when avg **&lt; 55 °C**  
+   - leave idle when avg **≥ 58 °C**  
+   While idle the payload **does not fight** the system’s own fan target.
+2. **Less polling** – every **5 s** (was 2 s); status log every **2 min**.
+3. **Quiet + cool curve** – target is chosen from current temp (max of CPU / SoC) so the fan stays quieter when cool and ramps earlier under load (lower peaks).
 
-- 85 °C
-- 80 °C
-- 75 °C
-- 70 °C
-- 65 °C
+### Curve (temp → target)
 
-Start with the 85 °C version if you are unsure which one to choose. Lower targets
-usually make the fan react earlier and run faster.
+| System temp | Target |
+|-------------|--------|
+| ≤ 42 °C     | 91 °C  |
+| 52 °C       | 84 °C  |
+| 58 °C       | 78 °C  |
+| 64 °C       | 72 °C  |
+| 70 °C       | 67 °C  |
+| 76 °C       | 63 °C  |
+| ≥ 85 °C     | 60 °C  |
 
-## What it does
+Linear interpolation between anchors. An extra **3 °C target hysteresis** avoids thrashing the controller near boundaries.
 
-The payload runs continuously in the background. It checks the current target
-every two seconds and restores the selected value if a game or system component
-changes it.
+The original automatic fan controller still decides actual fan speed; this payload only adjusts the *target temperature*.
 
-It does not force a fixed fan speed. The original automatic fan controller still
-decides how much cooling is needed.
+## SDK (no need to vendor binaries in your repo)
 
-Starting another version automatically stops the previous `fan_target.elf`
-process, so only one copy remains active.
+Use the official SDK from another repository instead of copying it into yours.
 
-## Log output
+### Option A – system install (simplest)
 
-The payload writes a short status line to the console and klog once a minute. It
-also reports target changes immediately.
-
-```text
-[fan_target] started; target=80 C
-[fan_target] target changed: 80 C -> 91 C
-[fan_target] target restored: 91 C -> 80 C
-[fan_target] status CPU=54 C, SoC=53 C, fan=18.6%, target=80 C
+```sh
+wget https://github.com/ps5-payload-dev/sdk/releases/latest/download/ps5-payload-sdk.zip
+sudo unzip -d /opt ps5-payload-sdk.zip
+export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 ```
+
+### Option B – git submodule (keeps SDK out of *your* tree as binary blobs)
+
+```sh
+git submodule add https://github.com/ps5-payload-dev/sdk.git sdk
+git submodule update --init --recursive
+
+# build/install the toolchain once into a local prefix
+make -C sdk DESTDIR="$(pwd)/sdk-install" install
+# (see upstream README for full deps: clang, lld, etc.)
+```
+
+The Makefile auto-detects, in order:
+
+1. `./sdk/toolchain/prospero.mk` (if you installed in-tree)
+2. `./sdk-install/toolchain/prospero.mk`
+3. `/opt/ps5-payload-sdk`
+
+So you never need to re-upload the SDK into your own repository.
 
 ## Build
 
-The PS5 Payload SDK is expected at `/opt/ps5-payload-sdk`.
-
 ```sh
-cd fan_target
 make clean all
+# → dist/fan_target.elf
 ```
 
-The finished files are placed in `dist`:
+### Compile-time overrides
 
-```text
-fan_target_85c.elf
-fan_target_80c.elf
-fan_target_75c.elf
-fan_target_70c.elf
-fan_target_65c.elf
-SHA256SUMS.txt
-```
+| Macro                     | Default | Meaning                                      |
+|---------------------------|---------|----------------------------------------------|
+| `FANTARGET_POLL_MS`       | 5000    | Poll interval (ms)                           |
+| `FANTARGET_LOG_SECONDS`   | 120     | Status log interval (s)                      |
+| `FANTARGET_IDLE_ENTER_C`  | 55      | 15-min avg below this → enter idle           |
+| `FANTARGET_HYSTERESIS_C`  | 3       | Idle exit = enter + this; also target hyst   |
+| `FANTARGET_TARGET_HYST_C` | 3       | Min Δ before rewriting fan target            |
+| `FANTARGET_HISTORY_SEC`   | 900     | Temperature history window (s)               |
 
-To build only one temperature:
+Example:
 
 ```sh
-make clean TARGETS=80 all
+make clean all CFLAGS="-std=c11 -Wall -Wextra -Werror -O2 -DFANTARGET_IDLE_ENTER_C=50 -DFANTARGET_HYSTERESIS_C=3"
 ```
 
 ## Start automatically
 
-`fan_target` can start at boot with **PLK Autoloader**. Copy the ELF you want to
-use into the autoloader's payload directory and add its file name to
-`autoload.txt`:
+With **PLK Autoloader**, copy `fan_target.elf` into the payload directory and add to `autoload.txt`:
 
 ```ini
 !100
-fan_target_80c.elf
+fan_target.elf
 ```
 
-Choose only one temperature version. If several versions are listed, each one
-will replace the previous process and the last one started will remain active.
-The optional `!100` line adds a short delay before launch and can be adjusted
-to match the rest of your autoload sequence.
+## Log examples
+
+```
+[fan_target] started; quiet+cool curve, idle enter<55 C exit>=58 C (hyst=3 C)
+[fan_target] poll=5000 ms, log every 120 s, target hyst=3 C
+[fan_target] target set: 91 C -> 84 C (temp=53 C, avg15m=49 C, raw=83 C)
+[fan_target] idle (avg15m=47 C < 55 C); leaving system target alone (exit when avg>=58 C)
+[fan_target] status CPU=45 C, SoC=44 C, fan=12.0%, target=91 C (idle, not fighting), avg15m=47 C [IDLE]
+[fan_target] left idle (avg15m=59 C >= 58 C); resuming curve control
+```
+
+## Original project
+
+Derivative of drakmor’s `fan_target` (GPL-3.0). Upstream provides fixed-target builds (85/80/75/70/65 °C).

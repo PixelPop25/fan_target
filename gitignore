@@ -1,0 +1,5 @@
+dist/
+sdk-install/
+*.elf
+*.o
+.DS_Store
