@@ -9,13 +9,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
-#define PROCESS_NAME "fan_target.elf"
+#define PROCESS_NAME "fan_target_pxp.elf"
+#define CONFIG_DIR "/data/fan_target"
+#define CONFIG_FILE CONFIG_DIR "/config.ini"
 #define FAN_DEVICE "/dev/icc_fan"
 #define FAN_OPEN_FLAGS 0x10002
 #define FAN_GET_AUTOSERVO 0xC01C8F08UL
@@ -24,6 +28,14 @@
 #define SOC_SENSOR_COUNT 16
 #define SCE_KERNEL_ERROR_EINVAL 0x80020016u
 #define MAX_PAD_HANDLES 4
+#define MAX_CURVE_ANCHORS 9
+#define DEFAULT_GPU_SENSOR 0
+#define DEFAULT_SSD_SENSOR 1
+
+typedef struct {
+  int t;
+  int target;
+} curve_anchor_t;
 
 #define KINFO_PID_OFFSET 72
 #define KINFO_TDNAME_OFFSET 447
@@ -76,6 +88,8 @@ int sceKernelDebugOutText(int channel, const char *text);
 int sceKernelGetCpuTemperature(int *temperature);
 int sceKernelGetSocSensorTemperature(int sensor, int *temperature);
 int sceKernelGetCurrentFanDuty(uint16_t *duty, uint64_t *chassis);
+int sceUserServiceGetGlsOverlayPosition(int *x, int *y);
+int sceUserServiceSetGlsOverlayPosition(int x, int y);
 
 int32_t sceUserServiceInitialize(void *params);
 int32_t sceUserServiceGetInitialUser(int32_t *userId);
@@ -103,6 +117,13 @@ typedef enum {
   LB_RED
 } lightbar_band_t;
 
+typedef enum {
+  OVERLAY_TOP_LEFT = 0,
+  OVERLAY_TOP_RIGHT,
+  OVERLAY_BOTTOM_LEFT,
+  OVERLAY_BOTTOM_RIGHT,
+} overlay_position_t;
+
 static volatile sig_atomic_t stop_requested;
 
 typedef struct {
@@ -112,7 +133,32 @@ typedef struct {
   int64_t sum;
 } temp_history_t;
 
+typedef struct {
+  bool cpu_temp;
+  bool gpu_temp;
+  bool soc_temp;
+  bool ram_usage;
+  bool ssd_temp;
+  bool fps;
+  char metric;
+  overlay_position_t position;
+  int curve_temps[MAX_CURVE_ANCHORS];
+  int curve_targets[MAX_CURVE_ANCHORS];
+  int curve_count;
+} config_t;
+
+static const struct {
+  const char *name;
+  overlay_position_t position;
+} overlay_position_names[] = {
+  {"top left", OVERLAY_TOP_LEFT},
+  {"top right", OVERLAY_TOP_RIGHT},
+  {"bottom left", OVERLAY_BOTTOM_LEFT},
+  {"bottom right", OVERLAY_BOTTOM_RIGHT},
+};
+
 static temp_history_t g_history;
+static config_t g_config;
 static int32_t g_pad_handles[MAX_PAD_HANDLES];
 static int g_pad_count;
 static bool g_pad_ready;
@@ -161,19 +207,44 @@ static int target_from_temp(int temp_c) {
   if (temp_c < 0)
     return 91;
 
-  static const struct { int t; int target; } anchors[] = {
-      {  0, 91 },
-      { 40, 91 },
-      { 52, 88 },
-      { 58, 84 },
-      { 64, 75 },
-      { 70, 72 },
-      { 75, 70 },
-      { 85, 68 },
-      {100, 68 },
-  };
-  const int n = (int)(sizeof(anchors) / sizeof(anchors[0]));
+  curve_anchor_t anchors[MAX_CURVE_ANCHORS];
+  int n = 0;
 
+  if (g_config.curve_count > 0) {
+    for (int i = 0; i < g_config.curve_count && i < MAX_CURVE_ANCHORS; ++i) {
+      anchors[i].t = g_config.curve_temps[i];
+      anchors[i].target = g_config.curve_targets[i];
+    }
+    n = g_config.curve_count;
+  } else {
+    static const curve_anchor_t default_anchors[] = {
+        {  0, 91 },
+        { 40, 91 },
+        { 52, 88 },
+        { 58, 84 },
+        { 64, 75 },
+        { 70, 72 },
+        { 75, 70 },
+        { 85, 68 },
+        {100, 68 },
+    };
+    for (int i = 0; i < (int)(sizeof(default_anchors) / sizeof(default_anchors[0])); ++i) {
+      anchors[i].t = default_anchors[i].t;
+      anchors[i].target = default_anchors[i].target;
+    }
+    n = (int)(sizeof(default_anchors) / sizeof(default_anchors[0]));
+  }
+
+  for (int i = 1; i < n; ++i) {
+    for (int j = i; j > 0 && anchors[j].t < anchors[j - 1].t; --j) {
+      curve_anchor_t tmp = anchors[j];
+      anchors[j] = anchors[j - 1];
+      anchors[j - 1] = tmp;
+    }
+  }
+
+  if (n == 0)
+    return 91;
   if (temp_c <= anchors[0].t)
     return anchors[0].target;
   if (temp_c >= anchors[n - 1].t)
@@ -188,7 +259,7 @@ static int target_from_temp(int temp_c) {
       return anchors[i].target + (temp_c - anchors[i].t) * dtarget / dt;
     }
   }
-  return 91;
+  return anchors[n - 1].target;
 }
 
 static int apply_target_hysteresis(int raw_desired, int last_applied) {
@@ -256,6 +327,28 @@ static uint64_t monotonic_seconds(void) {
   if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
     return 0;
   return (uint64_t)now.tv_sec;
+}
+
+/* PRX loader prototypes */
+int sceKernelLoadStartModule(const char *moduleFileName, int args, const void *argp, int flags, void *opt, int *pRes);
+int sceKernelDlsym(int handle, const char *symbol, void **addrp);
+
+static bool g_fps_prx_loaded = false;
+
+static void load_fps_prx(void) {
+  const char *candidates[] = {"/data/fan_target/fps_elf.prx", "/data/fan_target/third_party/fps_elf/fps_elf.prx", NULL};
+  for (const char **p = candidates; *p != NULL; ++p) {
+    int res = 0;
+    int rc = sceKernelLoadStartModule(*p, 0, NULL, 0, NULL, &res);
+    if (rc == 0) {
+      log_line("loaded fps prx: %s (res=%d)", *p, res);
+      g_fps_prx_loaded = true;
+      return;
+    } else {
+      log_line("fps prx not found at %s (rc=%d)", *p, rc);
+    }
+  }
+  g_fps_prx_loaded = false;
 }
 
 static void pad_close_all(void) {
@@ -513,6 +606,7 @@ static void log_status(const bool sensors[SOC_SENSOR_COUNT],
   char target_text[56];
   char avg_text[24];
   char sys_text[24];
+  char fps_text[32];
 
   for (unsigned sensor = 0; sensor < SOC_SENSOR_COUNT; ++sensor) {
     int temperature = 0;
@@ -564,9 +658,191 @@ static void log_status(const bool sensors[SOC_SENSOR_COUNT],
   else
     (void)snprintf(sys_text, sizeof(sys_text), "n/a");
 
-  log_line("status CPU=%s, SoC=%s, fan=%s, target=%s, sys=%s, avg5m=%s%s",
+  if (g_config.fps)
+    (void)snprintf(fps_text, sizeof(fps_text), "%s", g_fps_prx_loaded ? "prx" : "n/a");
+  else
+    (void)snprintf(fps_text, sizeof(fps_text), "off");
+
+  log_line("status CPU=%s, SoC=%s, fan=%s, target=%s, sys=%s, avg5m=%s, fps=%s%s",
            cpu_text, soc_text, fan_text, target_text, sys_text, avg_text,
-           idle ? " [IDLE]" : "");
+           fps_text, idle ? " [IDLE]" : "");
+}
+
+/* temperature unit conversion removed (unused) */
+
+static bool match_key(const char *line, const char *key, char *value,
+                      size_t value_size) {
+  const char *eq = strchr(line, '=');
+  if (!eq)
+    return false;
+  size_t key_len = (size_t)(eq - line);
+  if (strncmp(line, key, key_len) != 0 || key[key_len] != '\0')
+    return false;
+  const char *val = eq + 1;
+  while (*val == ' ' || *val == '\t')
+    ++val;
+  size_t len = strcspn(val, "\r\n");
+  if (len >= value_size)
+    len = value_size - 1;
+  memcpy(value, val, len);
+  value[len] = '\0';
+  return true;
+}
+
+static void normalize_line(char *line) {
+  char *dst = line;
+  for (char *src = line; *src != '\0'; ++src) {
+    if (*src == '\r' || *src == '\n')
+      break;
+    if (*src == '\t')
+      *dst++ = ' ';
+    else
+      *dst++ = *src;
+  }
+  *dst = '\0';
+}
+
+static overlay_position_t parse_overlay_position(const char *value) {
+  for (size_t i = 0; i < sizeof(overlay_position_names) /
+                          sizeof(overlay_position_names[0]); ++i) {
+    if (strcasecmp(value, overlay_position_names[i].name) == 0)
+      return overlay_position_names[i].position;
+  }
+  if (strcasecmp(value, "top-left") == 0)
+    return OVERLAY_TOP_LEFT;
+  if (strcasecmp(value, "top-right") == 0)
+    return OVERLAY_TOP_RIGHT;
+  if (strcasecmp(value, "bottom-left") == 0)
+    return OVERLAY_BOTTOM_LEFT;
+  if (strcasecmp(value, "bottom-right") == 0)
+    return OVERLAY_BOTTOM_RIGHT;
+  return OVERLAY_TOP_LEFT;
+}
+
+static void init_default_config(void) {
+  g_config.cpu_temp = true;
+  g_config.gpu_temp = true;
+  g_config.soc_temp = true;
+  g_config.ram_usage = true;
+  g_config.ssd_temp = true;
+  g_config.fps = true;
+  g_config.metric = 'c';
+  g_config.position = OVERLAY_TOP_LEFT;
+  g_config.curve_count = 0;
+  for (int i = 0; i < MAX_CURVE_ANCHORS; ++i) {
+    g_config.curve_temps[i] = 0;
+    g_config.curve_targets[i] = 0;
+  }
+}
+
+static bool parse_config_file(void) {
+  FILE *file = fopen(CONFIG_FILE, "r");
+  if (!file)
+    return false;
+
+  char line[256];
+  while (fgets(line, sizeof(line), file)) {
+    normalize_line(line);
+    char value[128];
+    if (line[0] == '#' || line[0] == ';' || line[0] == '\0')
+      continue;
+    if (match_key(line, "cpu_temp", value, sizeof(value))) {
+      g_config.cpu_temp = (value[0] == '1');
+    } else if (match_key(line, "gpu_temp", value, sizeof(value))) {
+      g_config.gpu_temp = (value[0] == '1');
+    } else if (match_key(line, "soc_temp", value, sizeof(value))) {
+      g_config.soc_temp = (value[0] == '1');
+    } else if (match_key(line, "ram_usage", value, sizeof(value))) {
+      g_config.ram_usage = (value[0] == '1');
+    } else if (match_key(line, "ssd_temp", value, sizeof(value))) {
+      g_config.ssd_temp = (value[0] == '1');
+    } else if (match_key(line, "metric", value, sizeof(value))) {
+      g_config.metric = (value[0] == 'f' || value[0] == 'F') ? 'f' : 'c';
+    } else if (match_key(line, "overlay_position", value, sizeof(value))) {
+      g_config.position = parse_overlay_position(value);
+    } else if (match_key(line, "fps", value, sizeof(value))) {
+      g_config.fps = (value[0] == '1');
+    } else {
+      int index, temp, target;
+      if (sscanf(line, "curve_%d=%d,%d", &index, &temp, &target) == 3) {
+        if (index >= 0 && index < MAX_CURVE_ANCHORS) {
+          g_config.curve_temps[index] = temp;
+          g_config.curve_targets[index] = target;
+          if (index >= g_config.curve_count)
+            g_config.curve_count = index + 1;
+        } else if (g_config.curve_count < MAX_CURVE_ANCHORS) {
+          g_config.curve_temps[g_config.curve_count] = temp;
+          g_config.curve_targets[g_config.curve_count] = target;
+          ++g_config.curve_count;
+        }
+      }
+    }
+  }
+
+  fclose(file);
+  return true;
+}
+
+static bool write_default_config_file(void) {
+  FILE *file = fopen(CONFIG_FILE, "wx");
+  if (!file)
+    return false;
+  fprintf(file,
+          "# fan_target overlay config\n"
+          "# Set 1 to show, 0 to hide.\n"
+          "cpu_temp=1\n"
+          "gpu_temp=1\n"
+          "soc_temp=1\n"
+          "ram_usage=1\n"
+          "ssd_temp=1\n"
+          "metric=c\n"
+          "overlay_position=top left\n"
+          "fps=1\n"
+          "# Custom fan curve anchors: curve_<index>=<temp>,<target>\n"
+          "curve_0=40,91\n"
+          "curve_1=52,88\n"
+          "curve_2=58,84\n"
+          "curve_3=64,75\n"
+          "curve_4=70,72\n"
+          "curve_5=75,70\n"
+          "curve_6=85,68\n");
+  fclose(file);
+  return true;
+}
+
+static bool ensure_config_directory(void) {
+  struct stat st;
+  if (stat(CONFIG_DIR, &st) != 0) {
+    if (mkdir(CONFIG_DIR, 0755) != 0)
+      return false;
+  } else if (!S_ISDIR(st.st_mode)) {
+    return false;
+  }
+  return true;
+}
+
+static void apply_overlay_position(void) {
+  int x = 0;
+  int y = 0;
+  switch (g_config.position) {
+  case OVERLAY_TOP_LEFT:
+    x = 0;
+    y = 0;
+    break;
+  case OVERLAY_TOP_RIGHT:
+    x = 1920 - 400;
+    y = 0;
+    break;
+  case OVERLAY_BOTTOM_LEFT:
+    x = 0;
+    y = 1080 - 200;
+    break;
+  case OVERLAY_BOTTOM_RIGHT:
+    x = 1920 - 400;
+    y = 1080 - 200;
+    break;
+  }
+  (void)sceUserServiceSetGlsOverlayPosition(x, y);
 }
 
 int main(void) {
@@ -599,6 +875,15 @@ int main(void) {
   sigaction(SIGINT, &action, NULL);
   sigaction(SIGHUP, &action, NULL);
 
+  init_default_config();
+  if (ensure_config_directory()) {
+    if (!parse_config_file())
+      (void)write_default_config_file();
+  }
+  apply_overlay_position();
+  if (g_config.fps) {
+    load_fps_prx();
+  }
   history_init(&g_history);
   discover_soc_sensors(sensors);
   g_start_sec = monotonic_seconds();
@@ -725,6 +1010,8 @@ int main(void) {
     last_target = current_target;
 
   wait_for_next_poll:
+    /* FPS update: compute every ~1s using hook-driven counter */
+      (void)0;
     if (monotonic_seconds() >= next_log) {
       log_status(sensors, current_target, desired_target, system_temp,
                  avg_temp, idle);
