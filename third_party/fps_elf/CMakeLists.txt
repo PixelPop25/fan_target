@@ -21,7 +21,11 @@ endif()
 message("IS_SUBPROJECT: ${IS_SUBPROJECT}")
 
 set(D_CWD "${CMAKE_CURRENT_SOURCE_DIR}")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${D_CWD}/../daemon/assets)
+# NOTE: upstream etaHEN points this at ../daemon/assets, a sibling folder
+# that only exists in etaHEN's own monorepo layout. fan_target doesn't have
+# that folder, which is what was making this fail to configure/build here.
+# Output into this project's own bin/ instead.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${D_CWD}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${D_CWD}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${D_CWD}/bin)	# static libs are archive
 set(D_SRC ${D_CWD}/src)

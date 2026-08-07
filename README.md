@@ -2,7 +2,7 @@
 
 Idle-aware fan curve, lightbar, and on-screen FPS/temps overlay.
 
-## How it works
+## How it works (etaHEN model)
 
 ```
 fan_target.elf starts
@@ -18,6 +18,9 @@ fan_target.elf starts
   └─ game up → inject fps_elf into game
         Gnm flip hook → FPS every 250ms → UDP :29028
 ```
+
+Injection matches etaHEN `Inject_Toolbox` / `inject_elf` (ptrace + elfldr_load).
+Sources under `third_party/injector/` (from etaHEN libNineS / libelfldr).
 
 In-tree fallback: push ELF to local elfldr on port 9021.
 

@@ -1,48 +1,32 @@
-
-/* Copyright (C) 2025 etaHEN / LightningMods
-
-This program is free software; you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the
-Free Software Foundation; either version 3, or (at your option) any
-later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program; see the file COPYING. If not, see
-<http://www.gnu.org/licenses/>.  */
+/* fan_target fps_elf — game process only (etaHEN-derived).
+ * Hooks Gnm flip, computes FPS on a 200ms window, sends to ShellUI overlay
+ * via localhost UDP. No disk I/O. Dies with the game.
+ */
 #include "defs.h"
 #include "Detour.h"
-#include "ipc.hpp"
-#include "proc.h"
-#include "ps5/kernel.h"
-#include "ucred.h"
 #include <cstdint>
-#include <iostream>
-#include "webserver.hpp"
+#include <cstdio>
+#include <cstring>
+#include <cstdarg>
 #include <chrono>
-
 #include <unistd.h>
-#include <util.hpp>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define u32 uint32_t
 #define s32 int32_t
-
-
+#define FPS_UDP_PORT 29028
+#define FPS_WINDOW_SEC 0.2
 
 extern "C" {
     long ptr_syscall = 0;
-   
-    int sceKernelLoadStartModule(const char *moduleFileName, int args, const void *argp, int flags, void *opt, int *pRes) ;
-    int sceKernelDlsym(int handle, const char *symbol, void **addrp);
-
+    int sceKernelLoadStartModule(const char *, int, const void *, int, void *, int *);
+    int sceKernelDlsym(int, const char *, void **);
     s32 sceGnmSubmitAndFlipCommandBuffersForWorkload(
-	u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
-	u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, u32 flip_arg);
+        u32, u32, u32 *[], u32 *[], u32 *[], u32 *[], u32, u32, u32, u32);
 }
+
 void __syscall() {
   asm(".intel_syntax noprefix\n"
       "  mov rax, rdi\n"
@@ -56,137 +40,76 @@ void __syscall() {
       "  ret\n");
 }
 
-struct OrbisKernelTimespec {
-    int64_t tv_sec;
-    int64_t tv_nsec;
-};
+typedef struct {
+    int32_t type, req_id, priority, msg_id, target_id, user_id;
+    int32_t unk1, unk2, app_id, error_num, unk3;
+    char use_icon_image_uri;
+    char message[1024], uri[1024], unkstr[1024];
+} OrbisNotificationRequest;
 
-extern "C" {
-    int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
-    int get_page_table_stats(int vm, int type, int* total, int* free);
-    int sceKernelGetCpuUsage(struct Proc_Stats* out, int32_t* size);
-    int sceKernelGetThreadName(uint32_t id, char* out);
-	int sceKernelGetCpuTemperature(int* cputemp);
-    int sceKernelClockGettime(int clockId, OrbisKernelTimespec* tp);
-}
+extern "C" int sceKernelSendNotificationRequest(int, OrbisNotificationRequest *, size_t, int);
 
 static int frame_count = 0;
+static double g_last_fps = 0.0;
+/* Exported-looking symbol so a debugger/overlay can locate it if needed */
+extern "C" volatile double fan_target_fps_value = 0.0;
 
-bool touch_file(const char* destfile) {
-    static constexpr int FLAGS = 0777;
-    int fd = open(destfile, O_WRONLY | O_CREAT | O_TRUNC, FLAGS);
-    if (fd > 0) {
-        close(fd);
-        return true;
+static int g_udp = -1;
+static struct sockaddr_in g_addr;
+
+static void udp_init(void) {
+    g_udp = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_udp < 0) return;
+    memset(&g_addr, 0, sizeof(g_addr));
+    g_addr.sin_family = AF_INET;
+    g_addr.sin_port = htons(FPS_UDP_PORT);
+    g_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+}
+
+static void udp_send(double fps) {
+    if (g_udp < 0) return;
+    sendto(g_udp, &fps, sizeof(fps), 0, (struct sockaddr *)&g_addr, sizeof(g_addr));
+}
+
+static void notify_once(const char *msg) {
+    OrbisNotificationRequest n{};
+    snprintf(n.message, sizeof(n.message), "%s", msg);
+    sceKernelSendNotificationRequest(0, &n, sizeof(n), 0);
+}
+
+static void on_flip(void) {
+    static auto last = std::chrono::high_resolution_clock::now();
+    auto now = std::chrono::high_resolution_clock::now();
+    auto delta = std::chrono::duration<double>(now - last).count();
+    frame_count++;
+    if (delta >= FPS_WINDOW_SEC) {
+        g_last_fps = frame_count / delta;
+        fan_target_fps_value = g_last_fps;
+        udp_send(g_last_fps);
+        frame_count = 0;
+        last = now;
+        klog_printf("fps_elf: %.1f\n", g_last_fps);
     }
-    return false;
 }
 
- typedef struct {
-   int32_t type;             // 0x00
-   int32_t req_id;           // 0x04
-   int32_t priority;         // 0x08
-   int32_t msg_id;           // 0x0C
-   int32_t target_id;        // 0x10
-   int32_t user_id;          // 0x14
-   int32_t unk1;             // 0x18
-   int32_t unk2;             // 0x1C
-   int32_t app_id;           // 0x20
-   int32_t error_num;        // 0x24
-   int32_t unk3;             // 0x28
-   char use_icon_image_uri;  // 0x2C
-   char message[1024];       // 0x2D
-   char uri[1024];           // 0x42D
-   char unkstr[1024];        // 0x82D
- } OrbisNotificationRequest; // Size = 0xC30
+static s32 (*orig_gnm)(u32, u32, u32 *[], u32 *[], u32 *[], u32 *[], u32, u32, u32, u32) = nullptr;
 
- extern "C" int sceKernelSendNotificationRequest(int userId, OrbisNotificationRequest *request, size_t requestSize, int flags);
-
-void printf_notification(const char* fmt, ...)
-{
-	OrbisNotificationRequest noti_buffer{};
-
-	va_list args{};
-	va_start(args, fmt);
-	int len = vsnprintf(noti_buffer.message, sizeof(noti_buffer.message), fmt, args);
-	va_end(args);
-
-	// these dont do anything currently
-	// that or the structure has changed
-	// lets just copy messages for now
-	/*
-	noti_buffer.type = 0;
-	noti_buffer.unk3 = 0;
-	noti_buffer.use_icon_image_uri = 0;
-	noti_buffer.target_id = -1;
-	*/
-	// trim newline
-	if (noti_buffer.message[len - 1] == '\n')
-	{
-		noti_buffer.message[len - 1] = '\0';
-	}
-	sceKernelSendNotificationRequest(0, (OrbisNotificationRequest*)&noti_buffer, sizeof(noti_buffer), 0);
+static s32 hook_gnm(u32 w, u32 c, u32 *d[], u32 *ds[], u32 *cc[], u32 *cs[],
+                    u32 vo, u32 bi, u32 fm, u32 fa) {
+    on_flip();
+    return orig_gnm(w, c, d, ds, cc, cs, vo, bi, fm, fa);
 }
 
-void CalculateAndPrintFPS() {
-	auto current_time = std::chrono::high_resolution_clock::now();
-	static auto last_time = current_time;
-	auto delta = std::chrono::duration<double>(current_time - last_time).count();
-	
-	frame_count++;
-
-	if (delta >= 1.0) {
-		double fps = frame_count / delta;
-		// Send FPS
-		printf_notification("FPS %.2f", fps);
-
-		frame_count = 0;
-		last_time = current_time;
-	}
-}
-
-s32 (*sceGnmSubmitAndFlipCommandBuffersForWorkload_orig)(
-	u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
-	u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, u32 flip_arg) = nullptr;
-
-s32 sceGnmSubmitAndFlipCommandBuffersForWorkload_hook(
-	u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
-	u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, u32 flip_arg) {
-	//printf("sceGnmSubmitAndFlipCommandBuffersForWorkload_hook called!\n");
-	CalculateAndPrintFPS();
-	int ret = sceGnmSubmitAndFlipCommandBuffersForWorkload_orig(
-		workload, count, dcb_gpu_addrs, dcb_sizes_in_bytes, ccb_gpu_addrs,
-		ccb_sizes_in_bytes, vo_handle, buf_idx, flip_mode, flip_arg);
-    if(ret == 0x80D11081){
-        printf("sceGnmSubmitAndFlipCommandBuffersForWorkload returned BUSY\n");
-    }
-	else
-    if(ret != 0) {
-		printf("sceGnmSubmitAndFlipCommandBuffersForWorkload returned error: %d\n", ret);
-	}
-
-	return ret;
-
-}
-
-int main(int argc, char const* argv[]) {
-    //OrbisKernelSwVersion sw;
-    char buff[256];
-    klog_puts("============== fps_elf Started =================");
-	printf_notification("fps_counter loaded!");
-
-    while(sceKernelMprotect(&buff, sizeof(buff), PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        klog_puts("sceKernelMprotect failed, retrying...");
+int main(int, char const **) {
+    char buf[256];
+    klog_puts("fps_elf start");
+    udp_init();
+    notify_once("fan_target FPS on");
+    while (sceKernelMprotect(buf, sizeof(buf), PROT_READ|PROT_WRITE|PROT_EXEC) != 0)
         sleep(1);
-    }
-
-    klog_printf("sceGnmSubmitAndFlipCommandBuffersForWorkload addr: %p\n", &sceGnmSubmitAndFlipCommandBuffersForWorkload);
-    sceGnmSubmitAndFlipCommandBuffersForWorkload_orig = (decltype(sceGnmSubmitAndFlipCommandBuffersForWorkload_orig))DetourFunction((uint64_t)&sceGnmSubmitAndFlipCommandBuffersForWorkload, (void*)&sceGnmSubmitAndFlipCommandBuffersForWorkload_hook);
-
-    while (true) {
-        game_log("sleeping ....");
-        sleep(0x10000);
-    }
+    orig_gnm = (decltype(orig_gnm))DetourFunction(
+        (uint64_t)&sceGnmSubmitAndFlipCommandBuffersForWorkload, (void *)hook_gnm);
+    klog_puts("fps_elf hooked Gnm");
+    for (;;) sleep(60);
     return 0;
-
 }
