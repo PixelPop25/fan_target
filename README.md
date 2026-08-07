@@ -19,9 +19,6 @@ fan_target.elf starts
         Gnm flip hook → FPS every 250ms → UDP :29028
 ```
 
-Injection matches etaHEN `Inject_Toolbox` / `inject_elf` (ptrace + elfldr_load).
-Sources under `third_party/injector/` (from etaHEN libNineS / libelfldr).
-
 In-tree fallback: push ELF to local elfldr on port 9021.
 
 ## FPS latency
