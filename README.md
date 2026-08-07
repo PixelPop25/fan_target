@@ -2,7 +2,7 @@
 
 Idle-aware fan curve, lightbar, and on-screen FPS/temps overlay.
 
-## How it works (etaHEN model)
+## How it works
 
 ```
 fan_target.elf starts
