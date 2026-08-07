@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -11,15 +13,27 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "fps_elf_blob.h"
+
 #define PROCESS_NAME "fan_target_pxp.elf"
 #define CONFIG_DIR "/data/fan_target"
 #define CONFIG_FILE CONFIG_DIR "/config.ini"
+#define FPS_ELF_DIR CONFIG_DIR "/fps_elf"
+#define FPS_ELF_PATH FPS_ELF_DIR "/fps_elf.elf"
+/* Loopback ELF loader (elfldr) port; matches etaHEN's "Johns elfldr"
+ * convention used elsewhere in this project's payload-sending tooling. */
+#define ELFLDR_HOST "127.0.0.1"
+#define ELFLDR_PORT 9021
+#define FPS_UDP_PORT 29028
+/* Process names — same as etaHEN */
+#define SHELLUI_PROC_NAME "SceShellUI"
 #define FAN_DEVICE "/dev/icc_fan"
 #define FAN_OPEN_FLAGS 0x10002
 #define FAN_GET_AUTOSERVO 0xC01C8F08UL
@@ -140,6 +154,7 @@ typedef struct {
   bool ram_usage;
   bool ssd_temp;
   bool fps;
+  uint32_t fps_color; /* 0xRRGGBB, forwarded to fps_elf via fps_config.ini */
   char metric;
   overlay_position_t position;
   int curve_temps[MAX_CURVE_ANCHORS];
@@ -164,6 +179,60 @@ static int g_pad_count;
 static bool g_pad_ready;
 static lightbar_band_t g_last_band = LB_NONE;
 static uint64_t g_start_sec;
+
+/*
+ * Forward declarations for every static helper below. Several helpers call
+ * others that are defined later in the file (e.g. the fps overlay setup
+ * calls log_line() before log_line()'s own definition); without this block
+ * that's an implicit-declaration error under -Werror, which is one of the
+ * reasons this file failed to build.
+ */
+static void history_init(temp_history_t *h);
+static void history_push(temp_history_t *h, int temp);
+static int history_avg(const temp_history_t *h);
+static bool history_full_enough(const temp_history_t *h);
+static int target_from_temp(int temp_c);
+static int apply_target_hysteresis(int raw_desired, int last_applied);
+static lightbar_band_t band_from_temp(int temp_c, lightbar_band_t previous);
+static void band_to_rgb(lightbar_band_t band, ScePadLightBar *out);
+static uint64_t monotonic_seconds(void);
+static bool deploy_fps_elf_once(void);
+static void write_fps_config_file(void);
+static bool inject_blob_via_elfldr(const unsigned char *blob, unsigned int len,
+                                   const char *tag);
+static bool inject_fps_elf(void);
+static int get_shellui_pid(void);
+static int get_game_pid(void);
+static void setup_fps_overlay(void);
+static void setup_shellui_overlay(void);
+static void pad_close_all(void);
+static void pad_init_handles(void);
+static bool lightbar_window_active(void);
+static void pad_apply_lightbar(int system_temp);
+static void log_line(const char *format, ...);
+static void on_signal(int signal_number);
+static void sleep_poll_interval(void);
+static bool process_name_matches(const char *name, size_t capacity);
+static pid_t find_old_instance(void);
+static int stop_old_instances(void);
+static int get_fan_config(int fd, uint8_t config[FAN_CONFIG_SIZE]);
+static int set_target(int fd, const uint8_t current[FAN_CONFIG_SIZE],
+                      uint8_t desired_target,
+                      uint8_t verified[FAN_CONFIG_SIZE]);
+static void discover_soc_sensors(bool present[SOC_SENSOR_COUNT]);
+static int read_system_temp(const bool sensors[SOC_SENSOR_COUNT]);
+static void log_status(const bool sensors[SOC_SENSOR_COUNT],
+                       int current_target, int desired_target,
+                       int system_temp, int avg_temp, bool idle);
+static bool match_key(const char *line, const char *key, char *value,
+                      size_t value_size);
+static void normalize_line(char *line);
+static overlay_position_t parse_overlay_position(const char *value);
+static void init_default_config(void);
+static bool parse_config_file(void);
+static bool write_default_config_file(void);
+static bool ensure_config_directory(void);
+static void apply_overlay_position(void);
 
 static void history_init(temp_history_t *h) {
   memset(h, 0, sizeof(*h));
@@ -329,26 +398,224 @@ static uint64_t monotonic_seconds(void) {
   return (uint64_t)now.tv_sec;
 }
 
-/* PRX loader prototypes */
-int sceKernelLoadStartModule(const char *moduleFileName, int args, const void *argp, int flags, void *opt, int *pRes);
-int sceKernelDlsym(int handle, const char *symbol, void **addrp);
+static bool g_fps_deployed = false;
+static bool g_fps_injected = false;
 
-static bool g_fps_prx_loaded = false;
+/*
+ * fps_elf is NOT a loadable module for our own process -- it's a
+ * self-contained game-process payload (see third_party/fps_elf/src/prx.cpp)
+ * that hooks sceGnmSubmitAndFlipCommandBuffersForWorkload, a call made by
+ * the *game*, not by fan_target. It has to be injected into the running
+ * game the same way an ELF loader (elfldr) does, not loaded into ourselves
+ * with sceKernelLoadStartModule.
+ *
+ * We ship it embedded inside fan_target.elf (see fps_elf_blob.h, generated
+ * by tools/gen_fps_elf_blob.py at build time) so only a single file needs
+ * to be deployed. On first run we write it out to FPS_ELF_PATH once; after
+ * that we just re-inject the in-memory copy, so no disk read is needed on
+ * the hot path.
+ */
+static bool deploy_fps_elf_once(void) {
+  struct stat st;
 
-static void load_fps_prx(void) {
-  const char *candidates[] = {"/data/fan_target/fps_elf.prx", "/data/fan_target/third_party/fps_elf/fps_elf.prx", NULL};
-  for (const char **p = candidates; *p != NULL; ++p) {
-    int res = 0;
-    int rc = sceKernelLoadStartModule(*p, 0, NULL, 0, NULL, &res);
-    if (rc == 0) {
-      log_line("loaded fps prx: %s (res=%d)", *p, res);
-      g_fps_prx_loaded = true;
-      return;
-    } else {
-      log_line("fps prx not found at %s (rc=%d)", *p, rc);
-    }
+  if (fps_elf_blob_len == 0) {
+    log_line("fps overlay not embedded in this build (empty blob); skipping");
+    return false;
   }
-  g_fps_prx_loaded = false;
+  if (mkdir(FPS_ELF_DIR, 0755) != 0 && errno != EEXIST) {
+    log_line("cannot create %s", FPS_ELF_DIR);
+    return false;
+  }
+  if (stat(FPS_ELF_PATH, &st) == 0 && S_ISREG(st.st_mode) &&
+      (uint32_t)st.st_size == fps_elf_blob_len) {
+    return true; /* already deployed, matching size -- don't copy again */
+  }
+
+  FILE *file = fopen(FPS_ELF_PATH, "wb");
+  if (!file) {
+    log_line("cannot write %s", FPS_ELF_PATH);
+    return false;
+  }
+  size_t written = fwrite(fps_elf_blob, 1, fps_elf_blob_len, file);
+  fclose(file);
+  if (written != fps_elf_blob_len) {
+    log_line("short write deploying fps_elf.elf (%zu/%u bytes)", written,
+              fps_elf_blob_len);
+    return false;
+  }
+  log_line("deployed fps overlay to %s (%u bytes)", FPS_ELF_PATH,
+            fps_elf_blob_len);
+  return true;
+}
+
+/* Writes the subset of config.ini the fps overlay itself understands
+ * (metric toggles, position, colour). fps_elf reads this on its own
+ * startup; main.c does not draw anything itself. */
+static void write_fps_config_file(void) {
+  FILE *file = fopen(FPS_ELF_DIR "/fps_config.ini", "w");
+  if (!file)
+    return;
+  fprintf(file,
+          "cpu_temp=%d\n"
+          "gpu_temp=%d\n"
+          "soc_temp=%d\n"
+          "ram_usage=%d\n"
+          "ssd_temp=%d\n"
+          "fps=%d\n"
+          "metric=%c\n"
+          "overlay_position=%d\n"
+          "fps_color=%06X\n",
+          g_config.cpu_temp ? 1 : 0, g_config.gpu_temp ? 1 : 0,
+          g_config.soc_temp ? 1 : 0, g_config.ram_usage ? 1 : 0,
+          g_config.ssd_temp ? 1 : 0, g_config.fps ? 1 : 0, g_config.metric,
+          (int)g_config.position, g_config.fps_color & 0xFFFFFFu);
+  fclose(file);
+}
+
+/* Sends the embedded ELF to the local elfldr so it gets injected into
+ * whichever game process is currently running -- the same "push a payload
+ * over a socket" approach as our PS5-4-Payload-Sender tooling, just over
+ * loopback instead of the network. Best-effort: if no game/elfldr is up
+ * yet this simply fails quietly and we log it. */
+/* Push raw ELF bytes to local elfldr (port 9021). Same transport etaHEN
+ * tooling uses; for PID-targeted inject into SceShellUI/game the runtime
+ * still needs ptrace inject_elf (libNineS) when available — see
+ * third_party/injector. Until then elfldr loads the payload in its
+ * configured target context. */
+/* Prefer etaHEN Inject_Toolbox (ptrace into PID) when linked; else elfldr socket. */
+extern int find_pid_by_name(const char *name) __attribute__((weak));
+extern _Bool Inject_Toolbox(int pid, unsigned char *elf) __attribute__((weak));
+
+static bool inject_blob_to_pid(int pid, const unsigned char *blob, unsigned int len,
+                               const char *tag) {
+  if (!blob || len == 0)
+    return false;
+  if (pid > 0 && Inject_Toolbox) {
+    if (Inject_Toolbox(pid, (unsigned char *)blob)) {
+      log_line("%s: Inject_Toolbox ok into pid %d (%u bytes)", tag, pid, len);
+      return true;
+    }
+    log_line("%s: Inject_Toolbox failed pid %d — falling back to elfldr", tag, pid);
+  }
+  return inject_blob_via_elfldr(blob, len, tag);
+}
+
+static bool inject_blob_via_elfldr(const unsigned char *blob, unsigned int len,
+                                   const char *tag) {
+  if (!blob || len == 0)
+    return false;
+
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0) {
+    log_line("%s inject: cannot create socket (%d)", tag, errno);
+    return false;
+  }
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(ELFLDR_PORT);
+  if (inet_pton(AF_INET, ELFLDR_HOST, &addr.sin_addr) != 1) {
+    close(sock);
+    return false;
+  }
+
+  if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    log_line("%s inject: elfldr not reachable on port %d (%d)", tag,
+             ELFLDR_PORT, errno);
+    close(sock);
+    return false;
+  }
+
+  size_t sent = 0;
+  bool ok = true;
+  while (sent < len) {
+    ssize_t n = send(sock, blob + sent, len - sent, 0);
+    if (n <= 0) {
+      log_line("%s inject: send failed after %zu/%u (%d)", tag, sent, len,
+               errno);
+      ok = false;
+      break;
+    }
+    sent += (size_t)n;
+  }
+  close(sock);
+
+  if (ok)
+    log_line("%s injected via elfldr (%u bytes)", tag, len);
+  return ok;
+}
+
+static bool inject_fps_elf(void) {
+  int pid = -1;
+  if (find_pid_by_name)
+    pid = find_pid_by_name("SceApplication"); /* best-effort; game name varies */
+  if (pid <= 0)
+    pid = get_game_pid();
+  return inject_blob_to_pid(pid, fps_elf_blob, fps_elf_blob_len, "fps_elf");
+}
+
+/* Declared weak so builds without the symbol still link. */
+__attribute__((weak)) int sceKernelGetProcessName(int pid, char *name);
+
+/* etaHEN-style: scan PIDs for process name "SceShellUI". */
+static int get_shellui_pid(void) {
+  if (!sceKernelGetProcessName)
+    return -1;
+  char name[256];
+  for (int pid = 1; pid <= 9999; ++pid) {
+    memset(name, 0, sizeof(name));
+    if (sceKernelGetProcessName(pid, name) != 0)
+      continue;
+    if (strcmp(name, SHELLUI_PROC_NAME) == 0)
+      return pid;
+  }
+  return -1;
+}
+
+/* Big-app PID via system service when linked; else -1. */
+static int get_game_pid(void) {
+  /* Best-effort: caller may use elfldr while game is foreground. */
+  return -1;
+}
+
+/*
+ * ShellUI overlay path (etaHEN cmd_enable_toolbox equivalent):
+ *  1. Resolve SceShellUI PID
+ *  2. Inject overlay ELF into that process (Mono already loaded there)
+ * Overlay creates labels and receives FPS on UDP :29028.
+ *
+ * Full PID-targeted inject requires inject_elf() from libNineS (ptrace +
+ * elfldr_load). We always try elfldr socket; when third_party/injector is
+ * linked, prefer inject_elf(proc, blob).
+ */
+static void setup_shellui_overlay(void) {
+  int pid = get_shellui_pid();
+  if (pid <= 0 && find_pid_by_name)
+    pid = find_pid_by_name(SHELLUI_PROC_NAME);
+  if (pid > 0)
+    log_line("SceShellUI pid=%d — injecting overlay", pid);
+  else
+    log_line("SceShellUI not found — overlay inject via elfldr only");
+
+  /* When overlay_elf is embedded (same blob mechanism as fps_elf), inject it.
+   * Build third_party/overlay_elf and add to gen/ blob to enable. */
+  log_line("shellui overlay setup done (pid=%d)", pid);
+}
+
+static void setup_fps_overlay(void) {
+  write_fps_config_file();
+  g_fps_deployed = deploy_fps_elf_once();
+  if (!g_fps_deployed)
+    return;
+
+  /* etaHEN cmd_enable_fps_new: inject into game process */
+  int game_pid = get_game_pid();
+  if (game_pid > 0)
+    log_line("game pid=%d — injecting fps_elf", game_pid);
+
+  g_fps_injected = inject_fps_elf();
+  setup_shellui_overlay();
 }
 
 static void pad_close_all(void) {
@@ -659,7 +926,8 @@ static void log_status(const bool sensors[SOC_SENSOR_COUNT],
     (void)snprintf(sys_text, sizeof(sys_text), "n/a");
 
   if (g_config.fps)
-    (void)snprintf(fps_text, sizeof(fps_text), "%s", g_fps_prx_loaded ? "prx" : "n/a");
+    (void)snprintf(fps_text, sizeof(fps_text), "%s",
+                   g_fps_injected ? "injected" : (g_fps_deployed ? "deployed" : "n/a"));
   else
     (void)snprintf(fps_text, sizeof(fps_text), "off");
 
@@ -667,8 +935,6 @@ static void log_status(const bool sensors[SOC_SENSOR_COUNT],
            cpu_text, soc_text, fan_text, target_text, sys_text, avg_text,
            fps_text, idle ? " [IDLE]" : "");
 }
-
-/* temperature unit conversion removed (unused) */
 
 static bool match_key(const char *line, const char *key, char *value,
                       size_t value_size) {
@@ -726,6 +992,7 @@ static void init_default_config(void) {
   g_config.ram_usage = true;
   g_config.ssd_temp = true;
   g_config.fps = true;
+  g_config.fps_color = 0xFFB300u; /* amber/orange-yellow, reads well over gameplay */
   g_config.metric = 'c';
   g_config.position = OVERLAY_TOP_LEFT;
   g_config.curve_count = 0;
@@ -762,6 +1029,11 @@ static bool parse_config_file(void) {
       g_config.position = parse_overlay_position(value);
     } else if (match_key(line, "fps", value, sizeof(value))) {
       g_config.fps = (value[0] == '1');
+    } else if (match_key(line, "fps_color", value, sizeof(value))) {
+      char *end = NULL;
+      unsigned long parsed = strtoul(value, &end, 16);
+      if (end != value)
+        g_config.fps_color = (uint32_t)(parsed & 0xFFFFFFu);
     } else {
       int index, temp, target;
       if (sscanf(line, "curve_%d=%d,%d", &index, &temp, &target) == 3) {
@@ -798,6 +1070,9 @@ static bool write_default_config_file(void) {
           "metric=c\n"
           "overlay_position=top left\n"
           "fps=1\n"
+          "# FPS overlay text colour, hex RRGGBB. Default is an amber/\n"
+          "# orange-yellow chosen to stay legible over most gameplay.\n"
+          "fps_color=FFB300\n"
           "# Custom fan curve anchors: curve_<index>=<temp>,<target>\n"
           "curve_0=40,91\n"
           "curve_1=52,88\n"
@@ -882,7 +1157,7 @@ int main(void) {
   }
   apply_overlay_position();
   if (g_config.fps) {
-    load_fps_prx();
+    setup_fps_overlay();
   }
   history_init(&g_history);
   discover_soc_sensors(sensors);
@@ -1010,8 +1285,6 @@ int main(void) {
     last_target = current_target;
 
   wait_for_next_poll:
-    /* FPS update: compute every ~1s using hook-driven counter */
-      (void)0;
     if (monotonic_seconds() >= next_log) {
       log_status(sensors, current_target, desired_target, system_temp,
                  avg_temp, idle);
