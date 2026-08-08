@@ -2,7 +2,7 @@
 
 Idle-aware fan curve + **ShellUI Mono HUD** (temps + FPS).
 
-## Architecture (no SSD spam, no notifications)
+## Architecture 
 
 ```
 fan_target.elf
