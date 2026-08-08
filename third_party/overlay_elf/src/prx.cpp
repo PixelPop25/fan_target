@@ -4,7 +4,6 @@
  * - Draws PUI labels in configured screen corner (top-left, top-right, bottom-left, bottom-right)
  * - Uses mono_thread_attach to ensure thread-safe Mono execution inside SceShellUI
  */
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -58,8 +57,8 @@ static MonoObject *lbl_ssd_name, *lbl_ssd_val;
 static MonoObject *lbl_ram_name, *lbl_ram_val;
 static MonoObject *lbl_fps_name, *lbl_fps_val;
 
-static std::atomic<double> g_fps{0.0};
-static std::atomic<uint64_t> g_last_fps_time{0};
+static double g_fps = 0.0;
+static uint64_t g_last_fps_time = 0;
 static bool g_widgets_created = false;
 
 typedef enum {
@@ -401,9 +400,9 @@ static void update_labels(void) {
   int ram_pct = get_ram_usage_percent();
 
   uint64_t now = get_time_ms();
-  uint64_t last_fps_time = g_last_fps_time.load();
+  uint64_t last_fps_time = __atomic_load_n(&g_last_fps_time, __ATOMIC_RELAXED);
   bool have_fps = (last_fps_time > 0 && (now - last_fps_time) < 2000);
-  double fps_val = g_fps.load();
+  double fps_val = __atomic_load_n(&g_fps, __ATOMIC_RELAXED);
 
   int visible_count = 0;
   if (g_config.show_cpu) visible_count++;
@@ -520,8 +519,9 @@ static void *udp_thread(void *) {
   for (;;) {
     double fps = 0;
     if (recv(s, &fps, sizeof(fps), 0) == (ssize_t)sizeof(fps)) {
-      g_fps.store(fps);
-      g_last_fps_time.store(get_time_ms());
+      uint64_t now_ms = get_time_ms();
+      __atomic_store_n(&g_fps, fps, __ATOMIC_RELAXED);
+      __atomic_store_n(&g_last_fps_time, now_ms, __ATOMIC_RELAXED);
     }
   }
   return nullptr;

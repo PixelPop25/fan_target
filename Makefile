@@ -39,6 +39,7 @@ $(DIST_DIR) $(GEN_DIR):
 
 fps_elf:
 	cmake -S $(FPS_ELF_SRC_DIR) -B $(FPS_ELF_BUILD_DIR) \
+		-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
 		-DPS5_PAYLOAD_SDK=$(PS5_PAYLOAD_SDK) \
 		-DCMAKE_C_COMPILER=$(PS5_PAYLOAD_SDK)/bin/prospero-clang \
 		-DCMAKE_CXX_COMPILER=$(PS5_PAYLOAD_SDK)/bin/prospero-clang++
@@ -48,6 +49,8 @@ fps_elf:
 overlay_elf:
 	mkdir -p third_party/overlay_elf/bin
 	$(PS5_PAYLOAD_SDK)/bin/prospero-clang++ -std=c++17 -O2 \
+		-I$(PS5_PAYLOAD_SDK)/target/include \
+		-Ithird_party/overlay_elf/include \
 		-o $(OVERLAY_ELF_BIN) third_party/overlay_elf/src/prx.cpp \
 		-lkernel_sys || true
 

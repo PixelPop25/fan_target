@@ -3,7 +3,6 @@
 Idle-aware fan curve + **ShellUI Mono HUD** (temps + FPS).
 
 ## Architecture 
-
 ```
 fan_target.elf
   ├─ fan / lightbar (this process)
