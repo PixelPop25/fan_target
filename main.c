@@ -1068,7 +1068,7 @@ static void apply_overlay_position(void) {
     break;
   }
   log_line("overlay position set to: %s (x=%d, y=%d)", pos_str, x, y);
-  if (sceUserServiceSetGlsOverlayPosition) {
+  if ((void *)sceUserServiceSetGlsOverlayPosition != NULL) {
     (void)sceUserServiceSetGlsOverlayPosition(x, y);
   }
 }

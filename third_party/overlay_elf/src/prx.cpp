@@ -57,9 +57,21 @@ static MonoObject *lbl_ssd_name, *lbl_ssd_val;
 static MonoObject *lbl_ram_name, *lbl_ram_val;
 static MonoObject *lbl_fps_name, *lbl_fps_val;
 
-static double g_fps = 0.0;
+/* g_fps is stored as a raw uint64_t so that __atomic_load_n / __atomic_store_n
+ * work (they require an integer/pointer type, not double). We bit-cast through
+ * a union – guaranteed safe on IEEE 754 / x86-64 where sizeof(double)==8. */
+static uint64_t g_fps_bits = 0;   /* bit-pattern of the latest FPS double */
 static uint64_t g_last_fps_time = 0;
 static bool g_widgets_created = false;
+
+static inline double g_fps_load(void) {
+    uint64_t bits = __atomic_load_n(&g_fps_bits, __ATOMIC_RELAXED);
+    double v; __builtin_memcpy(&v, &bits, sizeof(v)); return v;
+}
+static inline void g_fps_store(double fps) {
+    uint64_t bits; __builtin_memcpy(&bits, &fps, sizeof(bits));
+    __atomic_store_n(&g_fps_bits, bits, __ATOMIC_RELAXED);
+}
 
 typedef enum {
   POS_TOP_LEFT = 0,
@@ -402,7 +414,7 @@ static void update_labels(void) {
   uint64_t now = get_time_ms();
   uint64_t last_fps_time = __atomic_load_n(&g_last_fps_time, __ATOMIC_RELAXED);
   bool have_fps = (last_fps_time > 0 && (now - last_fps_time) < 2000);
-  double fps_val = __atomic_load_n(&g_fps, __ATOMIC_RELAXED);
+  double fps_val = g_fps_load();
 
   int visible_count = 0;
   if (g_config.show_cpu) visible_count++;
@@ -520,7 +532,7 @@ static void *udp_thread(void *) {
     double fps = 0;
     if (recv(s, &fps, sizeof(fps), 0) == (ssize_t)sizeof(fps)) {
       uint64_t now_ms = get_time_ms();
-      __atomic_store_n(&g_fps, fps, __ATOMIC_RELAXED);
+      g_fps_store(fps);
       __atomic_store_n(&g_last_fps_time, now_ms, __ATOMIC_RELAXED);
     }
   }
