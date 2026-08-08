@@ -877,7 +877,7 @@ static void log_status(const bool sensors[SOC_SENSOR_COUNT],
     (void)snprintf(sys_text, sizeof(sys_text), "n/a");
 
   if (g_config.fps)
-    (void)snprintf(fps_text, sizeof(fps_text), "%s",
+    (void)snprintf(fps_text, sizeof(fps_text), "on");
   else
     (void)snprintf(fps_text, sizeof(fps_text), "off");
 

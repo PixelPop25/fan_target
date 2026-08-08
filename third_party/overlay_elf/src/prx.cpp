@@ -4,10 +4,10 @@
  * - Draws PUI labels in configured screen corner (top-left, top-right, bottom-left, bottom-right)
  * - Uses mono_thread_attach to ensure thread-safe Mono execution inside SceShellUI
  */
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <cstdarg>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
 #include <strings.h>
 #include <unistd.h>
 #include <pthread.h>

@@ -23,7 +23,6 @@ along with this program; see the file COPYING. If not, see
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include "freebsd-helper.h"
 #include "ps5/payload.h"
 #include "ps5/kernel.h"
 
