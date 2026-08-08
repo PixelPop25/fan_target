@@ -1,23 +1,22 @@
-/* fan_target ShellUI overlay
- * Injected into SceShellUI — same model as etaHEN shellui.elf
- *
- * - Mono already loaded in process; we dlsym mono_* / kernel APIs
- * - Create Label widgets on RootWidget (CreateLabel / AppendChild)
- * - Hook Sce.PlayStation.PUI.Application.Update for per-frame refresh
- * - FPS from game via localhost UDP :29028 (sub-ms; value itself is a
- *   rolling window, updated every 250ms from fps_elf)
+/* overlay_elf — runs inside SceShellUI
+ * - Reads CPU, SoC, SSD temps & RAM usage in-process (no disk I/O on hot path)
+ * - Receives game FPS via UDP on 127.0.0.1:29028 from fps_elf
+ * - Draws PUI labels in configured screen corner (top-left, top-right, bottom-left, bottom-right)
+ * - Uses mono_thread_attach to ensure thread-safe Mono execution inside SceShellUI
  */
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
-#include <cmath>
+#include <strings.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/sysctl.h>
 
 #define FPS_UDP_PORT 29028
 
@@ -40,48 +39,135 @@ static MonoObject *(*mono_runtime_invoke)(MonoMethod *, void *, void **, MonoObj
 static MonoProperty *(*mono_class_get_property_from_name)(MonoClass *, const char *);
 static MonoMethod *(*mono_property_get_set_method)(MonoProperty *);
 static MonoMethod *(*mono_property_get_get_method)(MonoProperty *);
-static void *(*mono_compile_method)(MonoMethod *);
 static void *(*mono_object_unbox)(MonoObject *);
-static MonoMethod *(*mono_class_get_methods)(MonoClass *, void **);
-static char *(*mono_method_get_name)(MonoMethod *);
+static void *(*mono_thread_attach)(MonoDomain *);
 
 static int (*sceKernelDlsym_fn)(int, const char *, void **);
 static int (*sceKernelLoadStartModule_fn)(const char *, int, const void *, int, void *, int *);
 static int (*sceKernelGetCpuTemperature)(int *);
 static int (*sceKernelGetSocSensorTemperature)(int, int *);
-static int (*sceKernelSendNotificationRequest)(int, void *, size_t, int);
-static int (*get_page_table_stats)(int, int, int *, int *);
 
 static MonoDomain *Root_Domain;
 static MonoImage *pui_img;
-static MonoObject *Game;
 static MonoObject *rootWidget;
 static MonoObject *font;
 
-static MonoObject *lbl_cpu_t, *lbl_cpu_u, *lbl_gpu_t, *lbl_gpu_u;
-static MonoObject *lbl_ram, *lbl_fps;
+static MonoObject *lbl_cpu_name, *lbl_cpu_val;
+static MonoObject *lbl_soc_name, *lbl_soc_val;
+static MonoObject *lbl_ssd_name, *lbl_ssd_val;
+static MonoObject *lbl_ram_name, *lbl_ram_val;
+static MonoObject *lbl_fps_name, *lbl_fps_val;
 
 static std::atomic<double> g_fps{0.0};
-static std::atomic<int> g_have_fps{0};
+static std::atomic<uint64_t> g_last_fps_time{0};
 static bool g_widgets_created = false;
-static void (*OnRender_orig)(MonoObject *) = nullptr;
 
-typedef struct {
-  int32_t type, req_id, priority, msg_id, target_id, user_id;
-  int32_t unk1, unk2, app_id, error_num, unk3;
-  char use_icon_image_uri;
-  char message[1024];
-  char uri[1024];
-  char unkstr[1024];
-} OrbisNotificationRequest;
+typedef enum {
+  POS_TOP_LEFT = 0,
+  POS_TOP_RIGHT,
+  POS_BOTTOM_LEFT,
+  POS_BOTTOM_RIGHT
+} overlay_pos_t;
 
-static void notify(const char *fmt, ...) {
-  if (!sceKernelSendNotificationRequest) return;
-  OrbisNotificationRequest n{};
-  va_list ap; va_start(ap, fmt);
-  vsnprintf(n.message, sizeof(n.message), fmt, ap);
-  va_end(ap);
-  sceKernelSendNotificationRequest(0, &n, sizeof(n), 0);
+struct OverlayConfig {
+  bool show_cpu = true;
+  bool show_soc = true;
+  bool show_ssd = true;
+  bool show_ram = true;
+  bool show_fps = true;
+  char metric = 'c';
+  overlay_pos_t position = POS_TOP_LEFT;
+};
+
+static OverlayConfig g_config;
+
+/* ---- colour thresholds (RGBA 0-1 for UIColor) ---- */
+struct rgba { float r, g, b, a; };
+
+static rgba color_for_temp(int c) {
+  if (c < 0) return {1.0f, 1.0f, 1.0f, 1.0f};
+  if (c <= 50) return {0.20f, 0.95f, 0.30f, 1.0f};   /* green */
+  if (c <= 60) return {0.95f, 0.90f, 0.15f, 1.0f};   /* yellow */
+  if (c <= 70) return {1.00f, 0.55f, 0.10f, 1.0f};   /* orange */
+  return {1.00f, 0.15f, 0.12f, 1.0f};                 /* red */
+}
+
+static rgba color_for_fps(double fps) {
+  if (fps >= 40.0) return {0.20f, 0.95f, 0.30f, 1.0f}; /* green */
+  if (fps >= 30.0) return {0.55f, 0.95f, 0.25f, 1.0f}; /* yellowish green */
+  if (fps >= 20.0) return {1.00f, 0.75f, 0.15f, 1.0f}; /* orangeish yellow */
+  return {1.00f, 0.15f, 0.12f, 1.0f};                   /* red */
+}
+
+static rgba color_for_ram(int pct) {
+  if (pct < 0) return {1.0f, 1.0f, 1.0f, 1.0f};
+  if (pct < 70) return {0.20f, 0.95f, 0.30f, 1.0f};   /* green */
+  if (pct < 85) return {0.95f, 0.90f, 0.15f, 1.0f};   /* yellow */
+  if (pct < 93) return {1.00f, 0.55f, 0.10f, 1.0f};   /* orange */
+  return {1.00f, 0.15f, 0.12f, 1.0f};                 /* red */
+}
+
+static uint64_t get_time_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static int get_ram_usage_percent(void) {
+  uint64_t physmem = 0;
+  size_t len = sizeof(physmem);
+  int mib[2] = {CTL_HW, HW_PHYSMEM};
+  if (sysctl(mib, 2, &physmem, &len, NULL, 0) == 0 && physmem > 0) {
+    uint32_t page_size = 4096;
+    uint32_t free_count = 0, wire_count = 0, active_count = 0;
+    size_t sz = sizeof(uint32_t);
+
+    sysctlbyname("vm.stats.vm.v_free_count", &free_count, &sz, NULL, 0);
+    sysctlbyname("vm.stats.vm.v_wire_count", &wire_count, &sz, NULL, 0);
+    sysctlbyname("vm.stats.vm.v_active_count", &active_count, &sz, NULL, 0);
+
+    uint64_t total_pages = physmem / page_size;
+    if (total_pages > 0) {
+      uint64_t used_pages = wire_count + active_count;
+      if (used_pages == 0 && free_count > 0 && free_count <= total_pages) {
+        used_pages = total_pages - free_count;
+      }
+      int pct = (int)((used_pages * 100) / total_pages);
+      if (pct >= 0 && pct <= 100) return pct;
+    }
+  }
+  return -1;
+}
+
+static void load_config(void) {
+  FILE *f = fopen("/data/fan_target/config.ini", "r");
+  if (!f) return;
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    char *eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    char *key = line;
+    char *val = eq + 1;
+    char *nl = strpbrk(val, "\r\n");
+    if (nl) *nl = '\0';
+    while (*key == ' ' || *key == '\t') key++;
+    while (*val == ' ' || *val == '\t') val++;
+
+    if (strcasecmp(key, "cpu_temp") == 0) g_config.show_cpu = (val[0] == '1');
+    else if (strcasecmp(key, "soc_temp") == 0 || strcasecmp(key, "gpu_temp") == 0) g_config.show_soc = (val[0] == '1');
+    else if (strcasecmp(key, "ssd_temp") == 0) g_config.show_ssd = (val[0] == '1');
+    else if (strcasecmp(key, "ram_usage") == 0) g_config.show_ram = (val[0] == '1');
+    else if (strcasecmp(key, "fps") == 0) g_config.show_fps = (val[0] == '1');
+    else if (strcasecmp(key, "metric") == 0) g_config.metric = (val[0] == 'f' || val[0] == 'F') ? 'f' : 'c';
+    else if (strcasecmp(key, "overlay_position") == 0) {
+      if (strcasecmp(val, "top right") == 0 || strcasecmp(val, "top-right") == 0) g_config.position = POS_TOP_RIGHT;
+      else if (strcasecmp(val, "bottom left") == 0 || strcasecmp(val, "bottom-left") == 0) g_config.position = POS_BOTTOM_LEFT;
+      else if (strcasecmp(val, "bottom right") == 0 || strcasecmp(val, "bottom-right") == 0) g_config.position = POS_BOTTOM_RIGHT;
+      else g_config.position = POS_TOP_LEFT;
+    }
+  }
+  fclose(f);
 }
 
 static int load_module(const char *path) {
@@ -109,8 +195,6 @@ static bool resolve_all(void) {
   if (k < 0) k = load_module("libkernel_sys.sprx");
   SYM(k, sceKernelGetCpuTemperature);
   SYM(k, sceKernelGetSocSensorTemperature);
-  SYM(k, sceKernelSendNotificationRequest);
-  SYM(k, get_page_table_stats);
 
   int m = load_module("/system/common/lib/libmonosgen-2.0.sprx");
   if (m < 0) m = load_module("libmonosgen-2.0.sprx");
@@ -127,8 +211,8 @@ static bool resolve_all(void) {
   SYM(m, mono_class_get_property_from_name);
   SYM(m, mono_property_get_set_method);
   SYM(m, mono_property_get_get_method);
-  SYM(m, mono_compile_method);
   SYM(m, mono_object_unbox);
+  SYM(m, mono_thread_attach);
 
   if (!mono_get_root_domain || !mono_string_new) return false;
   Root_Domain = mono_get_root_domain();
@@ -136,7 +220,7 @@ static bool resolve_all(void) {
     pui_img = mono_image_loaded("Sce.PlayStation.PUI.dll");
     if (!pui_img) pui_img = mono_image_loaded("Sce.PlayStation.PUI");
   }
-  return Root_Domain != nullptr;
+  return Root_Domain != nullptr && pui_img != nullptr;
 }
 
 static MonoObject *New_Object(MonoClass *klass) {
@@ -144,19 +228,29 @@ static MonoObject *New_Object(MonoClass *klass) {
   return mono_object_new(Root_Domain, klass);
 }
 
-template<typename T>
-static void Set_Property(MonoClass *klass, MonoObject *inst, const char *name, T value) {
+static void Set_Property_Float(MonoClass *klass, MonoObject *inst, const char *name, float val) {
   if (!klass || !inst || !mono_class_get_property_from_name) return;
   MonoProperty *prop = mono_class_get_property_from_name(klass, name);
   if (!prop) return;
   MonoMethod *set = mono_property_get_set_method(prop);
   if (!set) return;
-  void *args[] = { &value };
+  void *args[] = { &val };
+  mono_runtime_invoke(set, inst, args, nullptr);
+}
+
+static void Set_Property_Bool(MonoClass *klass, MonoObject *inst, const char *name, bool val) {
+  if (!klass || !inst || !mono_class_get_property_from_name) return;
+  MonoProperty *prop = mono_class_get_property_from_name(klass, name);
+  if (!prop) return;
+  MonoMethod *set = mono_property_get_set_method(prop);
+  if (!set) return;
+  int32_t bval = val ? 1 : 0;
+  void *args[] = { &bval };
   mono_runtime_invoke(set, inst, args, nullptr);
 }
 
 static void Set_Property_Str(MonoClass *klass, MonoObject *inst, const char *name, const char *str) {
-  if (!klass || !inst) return;
+  if (!klass || !inst || !mono_class_get_property_from_name) return;
   MonoProperty *prop = mono_class_get_property_from_name(klass, name);
   if (!prop) return;
   MonoMethod *set = mono_property_get_set_method(prop);
@@ -167,7 +261,7 @@ static void Set_Property_Str(MonoClass *klass, MonoObject *inst, const char *nam
 }
 
 static void Set_Property_Obj(MonoClass *klass, MonoObject *inst, const char *name, MonoObject *obj) {
-  if (!klass || !inst) return;
+  if (!klass || !inst || !mono_class_get_property_from_name) return;
   MonoProperty *prop = mono_class_get_property_from_name(klass, name);
   if (!prop) return;
   MonoMethod *set = mono_property_get_set_method(prop);
@@ -178,7 +272,7 @@ static void Set_Property_Obj(MonoClass *klass, MonoObject *inst, const char *nam
 
 template<typename R>
 static R Get_Property(MonoClass *klass, MonoObject *inst, const char *name) {
-  if (!klass || !mono_class_get_property_from_name) return (R)0;
+  if (!klass) return (R)0;
   MonoProperty *prop = mono_class_get_property_from_name(klass, name);
   if (!prop) return (R)0;
   MonoMethod *get = mono_property_get_get_method(prop);
@@ -217,7 +311,7 @@ static MonoObject *CreateUIFont(int size, int style, int weight) {
 }
 
 static MonoObject *CreateLabel(const char *name, float x, float y, const char *text,
-                               MonoObject *fnt, int bold, float r, float g, float b, float a) {
+                               MonoObject *fnt, float r, float g, float b, float a) {
   MonoClass *labelClass = mono_class_from_name(pui_img, "Sce.PlayStation.PUI.UI2", "Label");
   if (!labelClass) return nullptr;
   MonoObject *label = New_Object(labelClass);
@@ -225,14 +319,13 @@ static MonoObject *CreateLabel(const char *name, float x, float y, const char *t
   if (mono_runtime_object_init) mono_runtime_object_init(label);
 
   Set_Property_Str(labelClass, label, "Name", name);
-  Set_Property<float>(labelClass, label, "X", x);
-  Set_Property<float>(labelClass, label, "Y", y);
+  Set_Property_Float(labelClass, label, "X", x);
+  Set_Property_Float(labelClass, label, "Y", y);
   Set_Property_Str(labelClass, label, "Text", text);
   if (fnt) Set_Property_Obj(labelClass, label, "Font", fnt);
-  Set_Property<int>(labelClass, label, "HorizontalAlignment", bold);
   Set_Property_Obj(labelClass, label, "TextColor", CreateUIColor(r, g, b, a));
-  Set_Property<bool>(labelClass, label, "FitWidthToText", true);
-  Set_Property<bool>(labelClass, label, "FitHeightToText", true);
+  Set_Property_Bool(labelClass, label, "FitWidthToText", true);
+  Set_Property_Bool(labelClass, label, "FitHeightToText", true);
   return label;
 }
 
@@ -245,101 +338,172 @@ static void Widget_Append_Child(MonoObject *widget, MonoObject *child) {
   mono_runtime_invoke(m, widget, args, nullptr);
 }
 
-static MonoObject *FindWidget(const char *name) {
-  if (!rootWidget || !pui_img) return nullptr;
-  MonoClass *wc = mono_class_from_name(pui_img, "Sce.PlayStation.PUI.UI2", "Widget");
-  MonoMethod *m = mono_class_get_method_from_name(wc, "FindWidgetByName", 1);
-  if (!m) return nullptr;
-  MonoString *s = mono_string_new(Root_Domain, name);
-  void *args[] = { s };
-  return mono_runtime_invoke(m, rootWidget, args, nullptr);
-}
-
-static void SetLabelText(MonoObject *label, const char *text) {
-  if (!label || !pui_img) return;
-  MonoClass *lc = mono_class_from_name(pui_img, "Sce.PlayStation.PUI.UI2", "Label");
-  Set_Property_Str(lc, label, "Text", text);
-}
-
 static void create_widgets(void) {
   if (g_widgets_created || !pui_img || !Root_Domain) return;
 
-  /* Game scene — same path as etaHEN */
-  MonoClass *appClass = mono_class_from_name(pui_img, "Sce.PlayStation.PUI", "Application");
-  /* RootWidget from Scene.Game if available; try common static accessors */
   MonoClass *sceneClass = mono_class_from_name(pui_img, "Sce.PlayStation.PUI.UI2", "Scene");
-  if (sceneClass && Game) {
-    rootWidget = Get_Property<MonoObject *>(sceneClass, Game, "RootWidget");
+  if (sceneClass) {
+    MonoProperty *gameProp = mono_class_get_property_from_name(sceneClass, "Game");
+    if (gameProp) {
+      MonoMethod *get = mono_property_get_get_method(gameProp);
+      if (get) {
+        MonoObject *game = mono_runtime_invoke(get, nullptr, nullptr, nullptr);
+        if (game)
+          rootWidget = Get_Property<MonoObject *>(sceneClass, game, "RootWidget");
+      }
+    }
   }
-  if (!rootWidget) {
-    /* Fallback: Application current scene */
-    notify("fan_target: waiting for RootWidget");
-    return;
-  }
+  if (!rootWidget) return;
 
-  font = CreateUIFont(22, 0, 0);
-  float y = 10.0f;
-  Widget_Append_Child(rootWidget, CreateLabel("id_cpu_label", 10, y, "CPU", font, 1, 0, 1, 1, 1));
-  lbl_cpu_t = CreateLabel("id_cpu_temp_value", 80, y, "--C", font, 0, 1, 0.6f, 0, 1);
-  lbl_cpu_u = CreateLabel("id_cpu_usage_value", 130, y, "--%", font, 0, 1, 0.6f, 0, 1);
-  Widget_Append_Child(rootWidget, lbl_cpu_t);
-  Widget_Append_Child(rootWidget, lbl_cpu_u);
-  y += 25;
-  Widget_Append_Child(rootWidget, CreateLabel("id_gpu_label", 10, y, "GPU", font, 1, 0, 1, 0, 1));
-  lbl_gpu_t = CreateLabel("id_gpu_temp_value", 80, y, "--C", font, 0, 1, 0.6f, 0, 1);
-  lbl_gpu_u = CreateLabel("id_gpu_usage_value", 130, y, "--%", font, 0, 1, 0.6f, 0, 1);
-  Widget_Append_Child(rootWidget, lbl_gpu_t);
-  Widget_Append_Child(rootWidget, lbl_gpu_u);
-  y += 25;
-  Widget_Append_Child(rootWidget, CreateLabel("id_ram_label", 10, y, "RAM", font, 1, 0, 1, 1, 1));
-  lbl_ram = CreateLabel("id_ram_value", 80, y, "--- MB", font, 0, 1, 0.6f, 0, 1);
-  Widget_Append_Child(rootWidget, lbl_ram);
-  y += 25;
-  Widget_Append_Child(rootWidget, CreateLabel("id_fps_label", 10, y, "FPS", font, 1, 1, 0, 1, 1));
-  lbl_fps = CreateLabel("id_fps_value", 80, y, "---", font, 0, 1, 1, 1, 1);
-  Widget_Append_Child(rootWidget, lbl_fps);
+  font = CreateUIFont(20, 0, 0);
+  rgba dim = {0.85f, 0.85f, 0.85f, 1.0f};
+
+  lbl_cpu_name = CreateLabel("id_cpu_label", 0, 0, "CPU", font, dim.r, dim.g, dim.b, dim.a);
+  lbl_cpu_val = CreateLabel("id_cpu_temp_value", 0, 0, "--C", font, 0.2f, 0.95f, 0.3f, 1.0f);
+  Widget_Append_Child(rootWidget, lbl_cpu_name);
+  Widget_Append_Child(rootWidget, lbl_cpu_val);
+
+  lbl_soc_name = CreateLabel("id_soc_label", 0, 0, "SoC", font, dim.r, dim.g, dim.b, dim.a);
+  lbl_soc_val = CreateLabel("id_soc_temp_value", 0, 0, "--C", font, 0.2f, 0.95f, 0.3f, 1.0f);
+  Widget_Append_Child(rootWidget, lbl_soc_name);
+  Widget_Append_Child(rootWidget, lbl_soc_val);
+
+  lbl_ssd_name = CreateLabel("id_ssd_label", 0, 0, "SSD", font, dim.r, dim.g, dim.b, dim.a);
+  lbl_ssd_val = CreateLabel("id_ssd_temp_value", 0, 0, "--C", font, 0.2f, 0.95f, 0.3f, 1.0f);
+  Widget_Append_Child(rootWidget, lbl_ssd_name);
+  Widget_Append_Child(rootWidget, lbl_ssd_val);
+
+  lbl_ram_name = CreateLabel("id_ram_label", 0, 0, "RAM", font, dim.r, dim.g, dim.b, dim.a);
+  lbl_ram_val = CreateLabel("id_ram_value", 0, 0, "--%", font, 0.2f, 0.95f, 0.3f, 1.0f);
+  Widget_Append_Child(rootWidget, lbl_ram_name);
+  Widget_Append_Child(rootWidget, lbl_ram_val);
+
+  lbl_fps_name = CreateLabel("id_fps_label", 0, 0, "FPS", font, dim.r, dim.g, dim.b, dim.a);
+  lbl_fps_val = CreateLabel("id_fps_value", 0, 0, "---", font, 0.2f, 0.95f, 0.3f, 1.0f);
+  Widget_Append_Child(rootWidget, lbl_fps_name);
+  Widget_Append_Child(rootWidget, lbl_fps_val);
 
   g_widgets_created = true;
-  notify("fan_target HUD labels created");
 }
 
 static void update_labels(void) {
-  char buf[64];
-  int cpu = -1, soc = -1;
+  if (!g_widgets_created || !pui_img) return;
+
+  MonoClass *labelClass = mono_class_from_name(pui_img, "Sce.PlayStation.PUI.UI2", "Label");
+  if (!labelClass) return;
+
+  int cpu = -1, soc = -1, ssd = -1;
   if (sceKernelGetCpuTemperature) sceKernelGetCpuTemperature(&cpu);
-  if (sceKernelGetSocSensorTemperature) sceKernelGetSocSensorTemperature(0, &soc);
+  if (sceKernelGetSocSensorTemperature) {
+    sceKernelGetSocSensorTemperature(0, &soc);
+    sceKernelGetSocSensorTemperature(1, &ssd);
+  }
+  int ram_pct = get_ram_usage_percent();
 
-  if (lbl_cpu_t) { snprintf(buf, sizeof(buf), "%dC", cpu); SetLabelText(lbl_cpu_t, buf); }
-  if (lbl_gpu_t) { snprintf(buf, sizeof(buf), "%dC", soc); SetLabelText(lbl_gpu_t, buf); }
+  uint64_t now = get_time_ms();
+  uint64_t last_fps_time = g_last_fps_time.load();
+  bool have_fps = (last_fps_time > 0 && (now - last_fps_time) < 2000);
+  double fps_val = g_fps.load();
 
-  if (lbl_ram && get_page_table_stats) {
-    int used = 0, free_ = 0;
-    get_page_table_stats(1, 1, &used, &free_);
-    snprintf(buf, sizeof(buf), "%d MB", used);
-    SetLabelText(lbl_ram, buf);
+  int visible_count = 0;
+  if (g_config.show_cpu) visible_count++;
+  if (g_config.show_soc) visible_count++;
+  if (g_config.show_ssd) visible_count++;
+  if (g_config.show_ram) visible_count++;
+  if (g_config.show_fps) visible_count++;
+
+  float start_x = 20.0f;
+  float start_y = 20.0f;
+  float line_height = 26.0f;
+
+  switch (g_config.position) {
+    case POS_TOP_LEFT:
+      start_x = 20.0f;
+      start_y = 20.0f;
+      break;
+    case POS_TOP_RIGHT:
+      start_x = 1740.0f;
+      start_y = 20.0f;
+      break;
+    case POS_BOTTOM_LEFT:
+      start_x = 20.0f;
+      start_y = 1080.0f - (visible_count * line_height + 20.0f);
+      break;
+    case POS_BOTTOM_RIGHT:
+      start_x = 1740.0f;
+      start_y = 1080.0f - (visible_count * line_height + 20.0f);
+      break;
   }
 
-  if (lbl_fps && g_have_fps.load()) {
-    snprintf(buf, sizeof(buf), "%.1f", g_fps.load());
-    SetLabelText(lbl_fps, buf);
-  }
-}
+  int row = 0;
+  char buf[32];
 
-static void OnRender_Hook(MonoObject *instance) {
-  static int wait = 0;
-  if (!g_widgets_created)
-    create_widgets();
-  if (wait <= 0) {
-    update_labels();
-    wait = 15; /* ~every 15 frames — responsive without thrashing Mono */
+  auto update_pair = [&](MonoObject *lbl_name, MonoObject *lbl_val, bool is_enabled,
+                         const char *val_str, rgba color) {
+    if (!lbl_name || !lbl_val) return;
+    if (is_enabled) {
+      float y = start_y + (row * line_height);
+      Set_Property_Float(labelClass, lbl_name, "X", start_x);
+      Set_Property_Float(labelClass, lbl_name, "Y", y);
+      Set_Property_Bool(labelClass, lbl_name, "Visible", true);
+
+      Set_Property_Float(labelClass, lbl_val, "X", start_x + 60.0f);
+      Set_Property_Float(labelClass, lbl_val, "Y", y);
+      Set_Property_Str(labelClass, lbl_val, "Text", val_str);
+      Set_Property_Obj(labelClass, lbl_val, "TextColor", CreateUIColor(color.r, color.g, color.b, color.a));
+      Set_Property_Bool(labelClass, lbl_val, "Visible", true);
+      row++;
+    } else {
+      Set_Property_Bool(labelClass, lbl_name, "Visible", false);
+      Set_Property_Bool(labelClass, lbl_val, "Visible", false);
+    }
+  };
+
+  // 1. CPU
+  if (cpu >= 0) {
+    int disp = (g_config.metric == 'f') ? (cpu * 9 / 5 + 32) : cpu;
+    snprintf(buf, sizeof(buf), "%d°%c", disp, (g_config.metric == 'f') ? 'F' : 'C');
   } else {
-    wait--;
+    snprintf(buf, sizeof(buf), "--");
   }
-  if (OnRender_orig)
-    OnRender_orig(instance);
+  update_pair(lbl_cpu_name, lbl_cpu_val, g_config.show_cpu, buf, color_for_temp(cpu));
+
+  // 2. SoC
+  if (soc >= 0) {
+    int disp = (g_config.metric == 'f') ? (soc * 9 / 5 + 32) : soc;
+    snprintf(buf, sizeof(buf), "%d°%c", disp, (g_config.metric == 'f') ? 'F' : 'C');
+  } else {
+    snprintf(buf, sizeof(buf), "--");
+  }
+  update_pair(lbl_soc_name, lbl_soc_val, g_config.show_soc, buf, color_for_temp(soc));
+
+  // 3. SSD
+  if (ssd >= 0) {
+    int disp = (g_config.metric == 'f') ? (ssd * 9 / 5 + 32) : ssd;
+    snprintf(buf, sizeof(buf), "%d°%c", disp, (g_config.metric == 'f') ? 'F' : 'C');
+  } else {
+    snprintf(buf, sizeof(buf), "--");
+  }
+  update_pair(lbl_ssd_name, lbl_ssd_val, g_config.show_ssd, buf, color_for_temp(ssd));
+
+  // 4. RAM
+  if (ram_pct >= 0) {
+    snprintf(buf, sizeof(buf), "%d%%", ram_pct);
+  } else {
+    snprintf(buf, sizeof(buf), "--%%");
+  }
+  update_pair(lbl_ram_name, lbl_ram_val, g_config.show_ram, buf, color_for_ram(ram_pct));
+
+  // 5. FPS
+  if (have_fps) {
+    snprintf(buf, sizeof(buf), "%.1f", fps_val);
+  } else {
+    snprintf(buf, sizeof(buf), "--");
+  }
+  rgba fps_col = have_fps ? color_for_fps(fps_val) : rgba{0.7f, 0.7f, 0.7f, 1.0f};
+  update_pair(lbl_fps_name, lbl_fps_val, g_config.show_fps, buf, fps_col);
 }
 
-/* ---- UDP receive (game → ShellUI); localhost, no disk ---- */
 static void *udp_thread(void *) {
   int s = socket(AF_INET, SOCK_DGRAM, 0);
   if (s < 0) return nullptr;
@@ -357,17 +521,25 @@ static void *udp_thread(void *) {
     double fps = 0;
     if (recv(s, &fps, sizeof(fps), 0) == (ssize_t)sizeof(fps)) {
       g_fps.store(fps);
-      g_have_fps.store(1);
+      g_last_fps_time.store(get_time_ms());
     }
   }
   return nullptr;
 }
 
 static void *poll_thread(void *) {
+  if (mono_thread_attach && Root_Domain) {
+    mono_thread_attach(Root_Domain);
+  }
+  uint32_t loop_count = 0;
   for (;;) {
+    if ((loop_count % 20) == 0) {
+      load_config();
+    }
     if (!g_widgets_created) create_widgets();
     update_labels();
-    usleep(100000);
+    usleep(100000); /* 100ms UI refresh */
+    loop_count++;
   }
   return nullptr;
 }
@@ -375,16 +547,12 @@ static void *poll_thread(void *) {
 int main(int argc, const char **argv) {
   (void)argc; (void)argv;
   if (!resolve_all()) {
-    notify("fan_target overlay: mono resolve failed");
     for (;;) sleep(60);
   }
-  pthread_t th;
+  pthread_t th, poll;
   pthread_create(&th, nullptr, udp_thread, nullptr);
-
-  pthread_t poll;
   pthread_create(&poll, nullptr, poll_thread, nullptr);
-
-  notify("fan_target overlay in SceShellUI");
   for (;;) sleep(60);
   return 0;
 }
+

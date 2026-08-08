@@ -1,24 +1,50 @@
-# PS5 Fan Target
+# fan_target
 
-Idle-aware fan curve, lightbar, and on-screen FPS/temps overlay.
+Idle-aware fan curve + **ShellUI Mono HUD** (temps + FPS).
 
-## FPS latency
+## Architecture (no SSD spam, no notifications)
 
-FPS is a rolling window (250ms). Localhost UDP adds well under 1ms — not the bottleneck.
-Labels refresh every 100ms in ShellUI.
+```
+fan_target.elf
+  ├─ fan / lightbar (this process)
+  ├─ inject overlay_elf → SceShellUI
+  │     Mono labels: CPU / SoC / FPS
+  │     colours by threshold
+  │     UDP bind 127.0.0.1:29028
+  └─ inject fps_elf → game
+        Gnm flip hook → FPS → UDP only
+```
+
+Live data never touches the SSD. Only optional one-shot ELF embeds at **build** time.
+
+### Temp colours
+| Range | Colour |
+|-------|--------|
+| ≤50°C | Green |
+| 51–60°C | Yellow |
+| 61–70°C | Orange |
+| ≥71°C | Red |
+
+### FPS colours
+| Range | Colour |
+|-------|--------|
+| ≥40 | Green |
+| 30–39 | Yellow-green |
+| 20–29 | Orange-yellow |
+| <20 | Red |
 
 ## Build
 
 ```sh
-make fps_elf PS5_PAYLOAD_SDK=/path/to/sdk   # embeds fps measurement ELF
-# build overlay_elf similarly, embed, then:
-make all
+export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+make fps_elf          # game FPS payload
+make overlay_elf      # ShellUI HUD
+make blob             # embed both into gen/
+make all              # dist/fan_target.elf
 ```
 
-## config.ini
-
-`/data/fan_target/config.ini` — `fps=1` enables inject path.
+Load **only** `dist/fan_target.elf`. It injects the rest.
 
 ## License
 
-GPL-3.0. Patterns/code derived from etaHEN (LightningMods) and upstream fan_target.
+GPL-3.0

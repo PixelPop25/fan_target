@@ -1,13 +1,12 @@
-/* fan_target fps_elf — game process only (etaHEN-derived).
- * Hooks Gnm flip, computes FPS on a 200ms window, sends to ShellUI overlay
- * via localhost UDP. No disk I/O. Dies with the game.
+/* fps_elf — injected into game process only
+ * Hooks Gnm flip, computes FPS, UDP to 127.0.0.1:29028
+ * No disk I/O. No notifications. Dies with the game.
  */
 #include "defs.h"
 #include "Detour.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cstdarg>
 #include <chrono>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -17,7 +16,7 @@
 #define u32 uint32_t
 #define s32 int32_t
 #define FPS_UDP_PORT 29028
-#define FPS_WINDOW_SEC 0.2
+#define FPS_WINDOW_SEC 0.25
 
 extern "C" {
     long ptr_syscall = 0;
@@ -40,20 +39,7 @@ void __syscall() {
       "  ret\n");
 }
 
-typedef struct {
-    int32_t type, req_id, priority, msg_id, target_id, user_id;
-    int32_t unk1, unk2, app_id, error_num, unk3;
-    char use_icon_image_uri;
-    char message[1024], uri[1024], unkstr[1024];
-} OrbisNotificationRequest;
-
-extern "C" int sceKernelSendNotificationRequest(int, OrbisNotificationRequest *, size_t, int);
-
 static int frame_count = 0;
-static double g_last_fps = 0.0;
-/* Exported-looking symbol so a debugger/overlay can locate it if needed */
-extern "C" volatile double fan_target_fps_value = 0.0;
-
 static int g_udp = -1;
 static struct sockaddr_in g_addr;
 
@@ -68,48 +54,53 @@ static void udp_init(void) {
 
 static void udp_send(double fps) {
     if (g_udp < 0) return;
-    sendto(g_udp, &fps, sizeof(fps), 0, (struct sockaddr *)&g_addr, sizeof(g_addr));
-}
-
-static void notify_once(const char *msg) {
-    OrbisNotificationRequest n{};
-    snprintf(n.message, sizeof(n.message), "%s", msg);
-    sceKernelSendNotificationRequest(0, &n, sizeof(n), 0);
+    sendto(g_udp, &fps, sizeof(fps), 0,
+           (struct sockaddr *)&g_addr, sizeof(g_addr));
 }
 
 static void on_flip(void) {
     static auto last = std::chrono::high_resolution_clock::now();
-    auto now = std::chrono::high_resolution_clock::now();
-    auto delta = std::chrono::duration<double>(now - last).count();
     frame_count++;
+    auto now = std::chrono::high_resolution_clock::now();
+    double delta = std::chrono::duration<double>(now - last).count();
     if (delta >= FPS_WINDOW_SEC) {
-        g_last_fps = frame_count / delta;
-        fan_target_fps_value = g_last_fps;
-        udp_send(g_last_fps);
+        double fps = (double)frame_count / delta;
         frame_count = 0;
         last = now;
-        klog_printf("fps_elf: %.1f\n", g_last_fps);
+        udp_send(fps);
     }
 }
 
-static s32 (*orig_gnm)(u32, u32, u32 *[], u32 *[], u32 *[], u32 *[], u32, u32, u32, u32) = nullptr;
+Detour *flip_detour = nullptr;
 
-static s32 hook_gnm(u32 w, u32 c, u32 *d[], u32 *ds[], u32 *cc[], u32 *cs[],
-                    u32 vo, u32 bi, u32 fm, u32 fa) {
+s32 sceGnmSubmitAndFlipCommandBuffersForWorkload_hook(
+    u32 workload, u32 count, u32 *dcbGpuAddrs[], u32 *dcbSizes[],
+    u32 *ccbGpuAddrs[], u32 *ccbSizes[], u32 state, u32 queue, u32 label, u32 labelValue) {
     on_flip();
-    return orig_gnm(w, c, d, ds, cc, cs, vo, bi, fm, fa);
+    return ((s32(*)(u32, u32, u32 *[], u32 *[], u32 *[], u32 *[], u32, u32, u32, u32))
+            flip_detour->GetOriginal())(
+        workload, count, dcbGpuAddrs, dcbSizes, ccbGpuAddrs, ccbSizes,
+        state, queue, label, labelValue);
 }
 
-int main(int, char const **) {
-    char buf[256];
-    klog_puts("fps_elf start");
+extern "C" int main(int argc, const char **argv) {
+    (void)argc; (void)argv;
     udp_init();
-    notify_once("fan_target FPS on");
-    while (sceKernelMprotect(buf, sizeof(buf), PROT_READ|PROT_WRITE|PROT_EXEC) != 0)
-        sleep(1);
-    orig_gnm = (decltype(orig_gnm))DetourFunction(
-        (uint64_t)&sceGnmSubmitAndFlipCommandBuffersForWorkload, (void *)hook_gnm);
-    klog_puts("fps_elf hooked Gnm");
+
+    int mod = sceKernelLoadStartModule("/system/common/lib/libSceGnmDriver.sprx", 0, 0, 0, 0, 0);
+    if (mod < 0)
+        mod = sceKernelLoadStartModule("libSceGnmDriver.sprx", 0, 0, 0, 0, 0);
+    void *sym = nullptr;
+    if (mod >= 0)
+        sceKernelDlsym(mod, "sceGnmSubmitAndFlipCommandBuffersForWorkload", &sym);
+    if (!sym) {
+        for (;;) sleep(60);
+    }
+
+    flip_detour = new Detour();
+    flip_detour->HookFunction((void *)sym,
+        (void *)sceGnmSubmitAndFlipCommandBuffersForWorkload_hook);
+
     for (;;) sleep(60);
     return 0;
 }

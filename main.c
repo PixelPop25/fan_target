@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "fps_elf_blob.h"
+#include "overlay_elf_blob.h"
 
 #define PROCESS_NAME "fan_target_pxp.elf"
 #define CONFIG_DIR "/data/fan_target"
@@ -196,8 +197,6 @@ static int apply_target_hysteresis(int raw_desired, int last_applied);
 static lightbar_band_t band_from_temp(int temp_c, lightbar_band_t previous);
 static void band_to_rgb(lightbar_band_t band, ScePadLightBar *out);
 static uint64_t monotonic_seconds(void);
-static bool deploy_fps_elf_once(void);
-static void write_fps_config_file(void);
 static bool inject_blob_via_elfldr(const unsigned char *blob, unsigned int len,
                                    const char *tag);
 static bool inject_fps_elf(void);
@@ -398,7 +397,6 @@ static uint64_t monotonic_seconds(void) {
   return (uint64_t)now.tv_sec;
 }
 
-static bool g_fps_deployed = false;
 static bool g_fps_injected = false;
 
 /*
@@ -415,62 +413,7 @@ static bool g_fps_injected = false;
  * that we just re-inject the in-memory copy, so no disk read is needed on
  * the hot path.
  */
-static bool deploy_fps_elf_once(void) {
-  struct stat st;
-
-  if (fps_elf_blob_len == 0) {
-    log_line("fps overlay not embedded in this build (empty blob); skipping");
-    return false;
-  }
-  if (mkdir(FPS_ELF_DIR, 0755) != 0 && errno != EEXIST) {
-    log_line("cannot create %s", FPS_ELF_DIR);
-    return false;
-  }
-  if (stat(FPS_ELF_PATH, &st) == 0 && S_ISREG(st.st_mode) &&
-      (uint32_t)st.st_size == fps_elf_blob_len) {
-    return true; /* already deployed, matching size -- don't copy again */
-  }
-
-  FILE *file = fopen(FPS_ELF_PATH, "wb");
-  if (!file) {
-    log_line("cannot write %s", FPS_ELF_PATH);
-    return false;
-  }
-  size_t written = fwrite(fps_elf_blob, 1, fps_elf_blob_len, file);
-  fclose(file);
-  if (written != fps_elf_blob_len) {
-    log_line("short write deploying fps_elf.elf (%zu/%u bytes)", written,
-              fps_elf_blob_len);
-    return false;
-  }
-  log_line("deployed fps overlay to %s (%u bytes)", FPS_ELF_PATH,
-            fps_elf_blob_len);
-  return true;
-}
-
-/* Writes the subset of config.ini the fps overlay itself understands
- * (metric toggles, position, colour). fps_elf reads this on its own
- * startup; main.c does not draw anything itself. */
-static void write_fps_config_file(void) {
-  FILE *file = fopen(FPS_ELF_DIR "/fps_config.ini", "w");
-  if (!file)
-    return;
-  fprintf(file,
-          "cpu_temp=%d\n"
-          "gpu_temp=%d\n"
-          "soc_temp=%d\n"
-          "ram_usage=%d\n"
-          "ssd_temp=%d\n"
-          "fps=%d\n"
-          "metric=%c\n"
-          "overlay_position=%d\n"
-          "fps_color=%06X\n",
-          g_config.cpu_temp ? 1 : 0, g_config.gpu_temp ? 1 : 0,
-          g_config.soc_temp ? 1 : 0, g_config.ram_usage ? 1 : 0,
-          g_config.ssd_temp ? 1 : 0, g_config.fps ? 1 : 0, g_config.metric,
-          (int)g_config.position, g_config.fps_color & 0xFFFFFFu);
-  fclose(file);
-}
+/* deploy_fps_elf_once removed: no SSD writes for payloads; inject from memory only */
 
 /* Sends the embedded ELF to the local elfldr so it gets injected into
  * whichever game process is currently running -- the same "push a payload
@@ -590,32 +533,40 @@ static int get_game_pid(void) {
  * linked, prefer inject_elf(proc, blob).
  */
 static void setup_shellui_overlay(void) {
+  /* Inject overlay_elf into SceShellUI — Mono HUD for temps + UDP FPS.
+   * No disk writes for live data. Overlay blob must be embedded at build. */
+  extern const unsigned char overlay_elf_blob[];
+  extern const unsigned int overlay_elf_blob_len;
   int pid = get_shellui_pid();
   if (pid <= 0 && find_pid_by_name)
     pid = find_pid_by_name(SHELLUI_PROC_NAME);
+  if (overlay_elf_blob_len == 0) {
+    log_line("overlay_elf not embedded — build third_party/overlay_elf and gen blob");
+    return;
+  }
   if (pid > 0)
-    log_line("SceShellUI pid=%d — injecting overlay", pid);
+    log_line("injecting overlay_elf into SceShellUI pid=%d (%u bytes)", pid,
+             overlay_elf_blob_len);
   else
-    log_line("SceShellUI not found — overlay inject via elfldr only");
-
-  /* When overlay_elf is embedded (same blob mechanism as fps_elf), inject it.
-   * Build third_party/overlay_elf and add to gen/ blob to enable. */
-  log_line("shellui overlay setup done (pid=%d)", pid);
+    log_line("SceShellUI pid unknown — overlay via elfldr (%u bytes)",
+             overlay_elf_blob_len);
+  (void)inject_blob_to_pid(pid, overlay_elf_blob, overlay_elf_blob_len,
+                           "overlay_elf");
 }
 
 static void setup_fps_overlay(void) {
-  write_fps_config_file();
-  g_fps_deployed = deploy_fps_elf_once();
-  if (!g_fps_deployed)
-    return;
+  /* Memory-only: inject embedded blobs. No /data writes for FPS/temps. */
+  setup_shellui_overlay();
 
-  /* etaHEN cmd_enable_fps_new: inject into game process */
+  if (fps_elf_blob_len == 0) {
+    log_line("fps_elf not embedded — build third_party/fps_elf and gen blob");
+    return;
+  }
   int game_pid = get_game_pid();
   if (game_pid > 0)
-    log_line("game pid=%d — injecting fps_elf", game_pid);
-
-  g_fps_injected = inject_fps_elf();
-  setup_shellui_overlay();
+    log_line("injecting fps_elf into game pid=%d", game_pid);
+  g_fps_injected = inject_blob_to_pid(game_pid, fps_elf_blob, fps_elf_blob_len,
+                                     "fps_elf");
 }
 
 static void pad_close_all(void) {
@@ -927,7 +878,6 @@ static void log_status(const bool sensors[SOC_SENSOR_COUNT],
 
   if (g_config.fps)
     (void)snprintf(fps_text, sizeof(fps_text), "%s",
-                   g_fps_injected ? "injected" : (g_fps_deployed ? "deployed" : "n/a"));
   else
     (void)snprintf(fps_text, sizeof(fps_text), "off");
 
@@ -1097,27 +1047,30 @@ static bool ensure_config_directory(void) {
 }
 
 static void apply_overlay_position(void) {
-  int x = 0;
-  int y = 0;
+  const char *pos_str = "top left";
+  int x = 0, y = 0;
   switch (g_config.position) {
   case OVERLAY_TOP_LEFT:
-    x = 0;
-    y = 0;
+    pos_str = "top left";
+    x = 20; y = 20;
     break;
   case OVERLAY_TOP_RIGHT:
-    x = 1920 - 400;
-    y = 0;
+    pos_str = "top right";
+    x = 1740; y = 20;
     break;
   case OVERLAY_BOTTOM_LEFT:
-    x = 0;
-    y = 1080 - 200;
+    pos_str = "bottom left";
+    x = 20; y = 980;
     break;
   case OVERLAY_BOTTOM_RIGHT:
-    x = 1920 - 400;
-    y = 1080 - 200;
+    pos_str = "bottom right";
+    x = 1740; y = 980;
     break;
   }
-  (void)sceUserServiceSetGlsOverlayPosition(x, y);
+  log_line("overlay position set to: %s (x=%d, y=%d)", pos_str, x, y);
+  if (sceUserServiceSetGlsOverlayPosition) {
+    (void)sceUserServiceSetGlsOverlayPosition(x, y);
+  }
 }
 
 int main(void) {
