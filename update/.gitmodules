@@ -1,0 +1,8 @@
+[submodule "sdk"]
+	path = sdk
+	url = https://github.com/ps5-payload-dev/sdk.git
+
+[submodule "third_party/etahen"]
+	path = third_party/etahen
+	url = https://github.com/etaHEN/etaHEN.git
+	branch = main
