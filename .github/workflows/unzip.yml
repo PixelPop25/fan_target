@@ -1,0 +1,49 @@
+name: Auto Unzip and Overwrite
+
+on:
+  push:
+    paths:
+      - 'update.zip' # Triggers only when update.zip is pushed
+  workflow_dispatch: # Allows manual trigger from the Actions tab
+
+jobs:
+  unzip-and-commit:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # Required to push the commit back
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Extract and Delete Zip File
+        run: |
+          if [ -f "update.zip" ]; then
+            # -o forces overwriting of existing files without prompting
+            # -d . extracts everything to the root directory
+            unzip -o update.zip -d .
+            
+            # Delete the zip file immediately after successful extraction
+            rm update.zip
+          else
+            echo "Error: update.zip not found."
+            exit 1
+          fi
+
+      - name: Commit and Push Changes
+        run: |
+          # Set up the bot user for committing
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # Stage all extracted files and the deletion of update.zip
+          git add .
+          
+          # Check if there are actual changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "auto: extract update.zip, overwrite existing files, and clean up archive"
+            git push
+          fi
