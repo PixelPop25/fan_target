@@ -24,7 +24,7 @@ extern "C" {
  * mprotect on another process (or the current one when pid == getpid()).
  * Prototype matches the SDK header; we declare it here so Detour.cpp
  * compiles without pulling in the full daemon include tree.               */
-int kernel_mprotect(pid_t pid, uint64_t addr, uint64_t len, int prot);
+int kernel_mprotect(pid_t pid, intptr_t addr, size_t size, int prot);
 
 #ifdef __cplusplus
 }

@@ -19,7 +19,7 @@ extern "C" {
 #include "ucred.h"
 #include "defs.h"
 #include "../lib/libmprotect.h"
-#include <cstdint>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
