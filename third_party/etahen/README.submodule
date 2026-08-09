@@ -1,0 +1,3 @@
+This directory is a git submodule.
+Run: git submodule update --init --recursive third_party/etahen
+The fps_elf.elf used in this build was produced from the original etaHEN fps_elf sources.

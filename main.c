@@ -489,7 +489,7 @@ static bool inject_blob_via_elfldr(const unsigned char *blob, unsigned int len,
   return ok;
 }
 
-static bool __attribute__((unused)) inject_fps_elf(void) {
+static bool inject_fps_elf(void) {
   int pid = -1;
   if (find_pid_by_name)
     pid = find_pid_by_name("SceApplication"); /* best-effort; game name varies */

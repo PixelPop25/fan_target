@@ -51,9 +51,8 @@ overlay_elf:
 	$(PS5_PAYLOAD_SDK)/bin/prospero-clang++ -std=c++17 -O2 \
 		-I$(PS5_PAYLOAD_SDK)/target/include \
 		-Ithird_party/overlay_elf/include \
-		-L$(PS5_PAYLOAD_SDK)/target/lib \
 		-o $(OVERLAY_ELF_BIN) third_party/overlay_elf/src/prx.cpp \
-		-lkernel_sys -lc++ -lc++abi -lunwind || true
+		-lkernel_sys || true
 
 blob: | $(GEN_DIR)
 	python3 tools/gen_fps_elf_blob.py $(FPS_ELF_BIN) $(GEN_DIR) fps_elf

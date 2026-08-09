@@ -1,4 +1,4 @@
-/* Generated — do not edit. */
+/* Generated â€” do not edit. */
 #pragma once
 #include <stddef.h>
 
