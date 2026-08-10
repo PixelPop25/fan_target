@@ -19,15 +19,20 @@
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <poll.h>
 
 #include "fps_elf_blob.h"
 #include "overlay_elf_blob.h"
+#include "icon_blob.h"
+#include "pic1_blob.h"
+#include "elfldr.h"
+#include "webui_html.h"
 
 #define PROCESS_NAME "fan_target_pxp.elf"
-#define CONFIG_DIR "/data/fan_target"
+#define CONFIG_DIR "/data/fan_target_pxp"
 #define CONFIG_FILE CONFIG_DIR "/config.ini"
-#define FPS_ELF_DIR CONFIG_DIR "/fps_elf"
-#define FPS_ELF_PATH FPS_ELF_DIR "/fps_elf.elf"
 /* Loopback ELF loader (elfldr) port; matches etaHEN's "Johns elfldr"
  * convention used elsewhere in this project's payload-sending tooling. */
 #define ELFLDR_HOST "127.0.0.1"
@@ -46,6 +51,14 @@
 #define MAX_CURVE_ANCHORS 9
 #define DEFAULT_GPU_SENSOR 0
 #define DEFAULT_SSD_SENSOR 1
+#define FAN_TARGET_VERSION "1.0"
+#define WEBUI_PORT 25500
+#define TITLE_ID "PXPFT0001"
+#define APP_INSTALL_DIR "/user/app/" TITLE_ID
+#define APP_SYS_DIR APP_INSTALL_DIR "/sce_sys"
+/* 66048 = Web Based Media App (Media tab) */
+#define APP_CATEGORY_MEDIA 66048
+#define FAN_TARGET_GREETING "Greetings by Issu.\n\nFan target " FAN_TARGET_VERSION
 
 typedef struct {
   int t;
@@ -100,11 +113,21 @@ typedef struct {
 #endif
 
 int sceKernelDebugOutText(int channel, const char *text);
+
+typedef struct {
+  char useless1[45];
+  char message[3075];
+} notify_request_t;
+
+int sceKernelSendNotificationRequest(int device, notify_request_t *req, size_t size, int flags);
+int sceAppInstUtilInitialize(void);
+int sceAppInstUtilAppUnInstall(const char *title_id);
+int sceAppInstUtilAppInstallTitleDir(const char *title_id, const char *dir, void *opt);
+
 int sceKernelGetCpuTemperature(int *temperature);
 int sceKernelGetSocSensorTemperature(int sensor, int *temperature);
 int sceKernelGetCurrentFanDuty(uint16_t *duty, uint64_t *chassis);
 int sceUserServiceGetGlsOverlayPosition(int *x, int *y);
-int sceUserServiceSetGlsOverlayPosition(int x, int y);
 
 int32_t sceUserServiceInitialize(void *params);
 int32_t sceUserServiceGetInitialUser(int32_t *userId);
@@ -155,12 +178,41 @@ typedef struct {
   bool ram_usage;
   bool ssd_temp;
   bool fps;
-  uint32_t fps_color; /* 0xRRGGBB, forwarded to fps_elf via fps_config.ini */
+  uint32_t fps_color; 
   char metric;
   overlay_position_t position;
   int curve_temps[MAX_CURVE_ANCHORS];
   int curve_targets[MAX_CURVE_ANCHORS];
   int curve_count;
+    int temp_green_max;   /* ≤ this → green */
+  int temp_yellow_max;  /* ≤ this → yellow */
+  int temp_orange_max;  /* ≤ this → orange; above → red */
+  uint32_t temp_color_green;
+  uint32_t temp_color_yellow;
+  uint32_t temp_color_orange;
+  uint32_t temp_color_red;
+    int fps_red_max;      /* ≤ this → red */
+  int fps_yellow_max;   /* ≤ this → yellow */
+  int fps_green_yellow_max; /* ≤ this → green-yellow; above → cyan-green */
+  uint32_t fps_color_red;
+  uint32_t fps_color_yellow;
+  uint32_t fps_color_green_yellow;
+  uint32_t fps_color_high;
+  bool fan_control;
+    bool lightbar_enable;
+  int lightbar_duration_sec;   
+  bool lightbar_flash_on_red;  /* flash when ≥ lightbar_flash_temp */
+  int lightbar_flash_temp;     /* default 75 */
+  int lightbar_blue_max;       /* < this → blue */
+  int lightbar_green_min;
+  int lightbar_green_max;
+  int lightbar_orange_min;
+  int lightbar_orange_max;
+  int lightbar_red_min;        /* ≥ this → red */
+  uint32_t lightbar_color_blue;
+  uint32_t lightbar_color_green;
+  uint32_t lightbar_color_orange;
+  uint32_t lightbar_color_red;
 } config_t;
 
 static const struct {
@@ -180,6 +232,11 @@ static int g_pad_count;
 static bool g_pad_ready;
 static lightbar_band_t g_last_band = LB_NONE;
 static uint64_t g_start_sec;
+static atomic_int g_lightbar_temp;
+static volatile int g_lightbar_stop = 0;
+static pthread_t g_lightbar_thread;
+static int g_lightbar_thread_started = 0;
+
 
 /*
  * Forward declarations for every static helper below. Several helpers call
@@ -220,9 +277,6 @@ static int set_target(int fd, const uint8_t current[FAN_CONFIG_SIZE],
                       uint8_t verified[FAN_CONFIG_SIZE]);
 static void discover_soc_sensors(bool present[SOC_SENSOR_COUNT]);
 static int read_system_temp(const bool sensors[SOC_SENSOR_COUNT]);
-static void log_status(const bool sensors[SOC_SENSOR_COUNT],
-                       int current_target, int desired_target,
-                       int system_temp, int avg_temp, bool idle);
 static bool match_key(const char *line, const char *key, char *value,
                       size_t value_size);
 static void normalize_line(char *line);
@@ -231,7 +285,6 @@ static void init_default_config(void);
 static bool parse_config_file(void);
 static bool write_default_config_file(void);
 static bool ensure_config_directory(void);
-static void apply_overlay_position(void);
 
 static void history_init(temp_history_t *h) {
   memset(h, 0, sizeof(*h));
@@ -350,42 +403,38 @@ static lightbar_band_t band_from_temp(int temp_c, lightbar_band_t previous) {
   if (temp_c < 0)
     return previous != LB_NONE ? previous : LB_BLUE;
 
-  if (temp_c < 53)
+  if (temp_c < g_config.lightbar_blue_max)
     return LB_BLUE;
-  if (temp_c >= 55 && temp_c <= 62)
+  if (temp_c >= g_config.lightbar_green_min && temp_c <= g_config.lightbar_green_max)
     return LB_GREEN;
-  if (temp_c >= 64 && temp_c <= 70)
+  if (temp_c >= g_config.lightbar_orange_min && temp_c <= g_config.lightbar_orange_max)
     return LB_ORANGE;
-  if (temp_c >= 72)
+  if (temp_c >= g_config.lightbar_red_min)
     return LB_RED;
-
-  /* gap zones: 53–54, 63, 71 — keep previous, default blue */
   return previous != LB_NONE ? previous : LB_BLUE;
 }
 
-static void band_to_rgb(lightbar_band_t band, ScePadLightBar *out) {
+static void color_u32_to_rgb(uint32_t c, ScePadLightBar *out) {
+  out->r = (uint8_t)((c >> 16) & 0xFF);
+  out->g = (uint8_t)((c >> 8) & 0xFF);
+  out->b = (uint8_t)(c & 0xFF);
   out->reserved = 0;
+}
+
+static void band_to_rgb(lightbar_band_t band, ScePadLightBar *out) {
   switch (band) {
   case LB_RED:
-    out->r = 255;
-    out->g = 0;
-    out->b = 0;
+    color_u32_to_rgb(g_config.lightbar_color_red, out);
     break;
   case LB_ORANGE:
-    out->r = 255;
-    out->g = 100;
-    out->b = 0;
+    color_u32_to_rgb(g_config.lightbar_color_orange, out);
     break;
   case LB_GREEN:
-    out->r = 0;
-    out->g = 220;
-    out->b = 40;
+    color_u32_to_rgb(g_config.lightbar_color_green, out);
     break;
   case LB_BLUE:
   default:
-    out->r = 0;
-    out->g = 80;
-    out->b = 255;
+    color_u32_to_rgb(g_config.lightbar_color_blue, out);
     break;
   }
 }
@@ -398,34 +447,9 @@ static uint64_t monotonic_seconds(void) {
 }
 
 static bool g_fps_injected = false;
+static bool g_overlay_ok = false;
 
-/*
- * fps_elf is NOT a loadable module for our own process -- it's a
- * self-contained game-process payload (see third_party/fps_elf/src/prx.cpp)
- * that hooks sceGnmSubmitAndFlipCommandBuffersForWorkload, a call made by
- * the *game*, not by fan_target. It has to be injected into the running
- * game the same way an ELF loader (elfldr) does, not loaded into ourselves
- * with sceKernelLoadStartModule.
- *
- * We ship it embedded inside fan_target.elf (see fps_elf_blob.h, generated
- * by tools/gen_fps_elf_blob.py at build time) so only a single file needs
- * to be deployed. On first run we write it out to FPS_ELF_PATH once; after
- * that we just re-inject the in-memory copy, so no disk read is needed on
- * the hot path.
- */
-/* deploy_fps_elf_once removed: no SSD writes for payloads; inject from memory only */
 
-/* Sends the embedded ELF to the local elfldr so it gets injected into
- * whichever game process is currently running -- the same "push a payload
- * over a socket" approach as our PS5-4-Payload-Sender tooling, just over
- * loopback instead of the network. Best-effort: if no game/elfldr is up
- * yet this simply fails quietly and we log it. */
-/* Push raw ELF bytes to local elfldr (port 9021). Same transport etaHEN
- * tooling uses; for PID-targeted inject into SceShellUI/game the runtime
- * still needs ptrace inject_elf (libNineS) when available — see
- * third_party/injector. Until then elfldr loads the payload in its
- * configured target context. */
-/* Prefer etaHEN Inject_Toolbox (ptrace into PID) when linked; else elfldr socket. */
 extern int find_pid_by_name(const char *name) __attribute__((weak));
 extern _Bool Inject_Toolbox(int pid, unsigned char *elf) __attribute__((weak));
 
@@ -433,13 +457,20 @@ static bool inject_blob_to_pid(int pid, const unsigned char *blob, unsigned int 
                                const char *tag) {
   if (!blob || len == 0)
     return false;
-  if (pid > 0 && Inject_Toolbox) {
-    if (Inject_Toolbox(pid, (unsigned char *)blob)) {
-      log_line("%s: Inject_Toolbox ok into pid %d (%u bytes)", tag, pid, len);
+
+  if (pid > 0) {
+    if (Inject_Toolbox && Inject_Toolbox(pid, (unsigned char *)blob)) {
+      log_line("%s: Inject_Toolbox ok pid=%d (%u)", tag, pid, len);
       return true;
     }
-    log_line("%s: Inject_Toolbox failed pid %d — falling back to elfldr", tag, pid);
+    /* Direct ptrace inject into target (ShellUI / game) */
+    if (elfldr_exec((pid_t)pid, -1, (uint8_t *)blob) == 0) {
+      log_line("%s: elfldr_exec ok pid=%d (%u)", tag, pid, len);
+      return true;
+    }
+    log_line("%s: elfldr_exec failed pid=%d — trying socket fallback", tag, pid);
   }
+
   return inject_blob_via_elfldr(blob, len, tag);
 }
 
@@ -449,10 +480,8 @@ static bool inject_blob_via_elfldr(const unsigned char *blob, unsigned int len,
     return false;
 
   int sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0) {
-    log_line("%s inject: cannot create socket (%d)", tag, errno);
+  if (sock < 0)
     return false;
-  }
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -464,8 +493,6 @@ static bool inject_blob_via_elfldr(const unsigned char *blob, unsigned int len,
   }
 
   if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-    log_line("%s inject: elfldr not reachable on port %d (%d)", tag,
-             ELFLDR_PORT, errno);
     close(sock);
     return false;
   }
@@ -484,8 +511,6 @@ static bool inject_blob_via_elfldr(const unsigned char *blob, unsigned int len,
   }
   close(sock);
 
-  if (ok)
-    log_line("%s injected via elfldr (%u bytes)", tag, len);
   return ok;
 }
 
@@ -498,15 +523,16 @@ static bool inject_fps_elf(void) {
   return inject_blob_to_pid(pid, fps_elf_blob, fps_elf_blob_len, "fps_elf");
 }
 
-/* Declared weak so builds without the symbol still link. */
 __attribute__((weak)) int sceKernelGetProcessName(int pid, char *name);
 
-/* etaHEN-style: scan PIDs for process name "SceShellUI". */
 static int get_shellui_pid(void) {
+  pid_t p = elfldr_find_pid(SHELLUI_PROC_NAME);
+  if (p > 0)
+    return (int)p;
   if (!sceKernelGetProcessName)
     return -1;
   char name[256];
-  for (int pid = 1; pid <= 9999; ++pid) {
+  for (int pid = 1; pid <= 12000; ++pid) {
     memset(name, 0, sizeof(name));
     if (sceKernelGetProcessName(pid, name) != 0)
       continue;
@@ -516,55 +542,78 @@ static int get_shellui_pid(void) {
   return -1;
 }
 
-/* Big-app PID via system service when linked; else -1. */
 static int get_game_pid(void) {
-  /* Best-effort: caller may use elfldr while game is foreground. */
+  extern int sceSystemServiceGetAppIdOfBigApp(void) __attribute__((weak));
+  if (sceSystemServiceGetAppIdOfBigApp) {
+    int app = sceSystemServiceGetAppIdOfBigApp();
+    if (app > 0)
+      return app;
+  }
+  if (find_pid_by_name) {
+    /* Common big-app process names when available via toolbox. */
+    static const char *candidates[] = {
+      "eboot", "SceApplication", "CUSA", NULL
+    };
+    for (int i = 0; candidates[i]; ++i) {
+      int pid = find_pid_by_name(candidates[i]);
+      if (pid > 0)
+        return pid;
+    }
+  }
+  if (!sceKernelGetProcessName)
+    return -1;
+  static const char *skip[] = {
+    "SceShellUI", "SceShellCore", "SceSysCore", "SceVshDaemon",
+    "SceRpcAgent", "SceDiscPlayer", "ScePartyDaemon", "SceRemotePlay",
+    "SceGameLiveStreaming", "SceSpCore", "SceAudioSystem", PROCESS_NAME,
+    NULL
+  };
+  char name[256];
+  for (int pid = 1; pid <= 12000; ++pid) {
+    memset(name, 0, sizeof(name));
+    if (sceKernelGetProcessName(pid, name) != 0 || name[0] == '\0')
+      continue;
+    int ignored = 0;
+    for (int i = 0; skip[i]; ++i) {
+      if (strcmp(name, skip[i]) == 0) {
+        ignored = 1;
+        break;
+      }
+    }
+    if (ignored)
+      continue;
+    if (strncmp(name, "SceShell", 8) == 0 || strncmp(name, "SceSys", 6) == 0)
+      continue;
+    return pid;
+  }
   return -1;
 }
 
-/*
- * ShellUI overlay path (etaHEN cmd_enable_toolbox equivalent):
- *  1. Resolve SceShellUI PID
- *  2. Inject overlay ELF into that process (Mono already loaded there)
- * Overlay creates labels and receives FPS on UDP :29028.
- *
- * Full PID-targeted inject requires inject_elf() from libNineS (ptrace +
- * elfldr_load). We always try elfldr socket; when third_party/injector is
- * linked, prefer inject_elf(proc, blob).
- */
 static void setup_shellui_overlay(void) {
-  /* Inject overlay_elf into SceShellUI — Mono HUD for temps + UDP FPS.
-   * No disk writes for live data. Overlay blob must be embedded at build. */
   extern const unsigned char overlay_elf_blob[];
   extern const unsigned int overlay_elf_blob_len;
+  if (overlay_elf_blob_len == 0) {
+    log_line("overlay_elf blob empty");
+    return;
+  }
   int pid = get_shellui_pid();
   if (pid <= 0 && find_pid_by_name)
     pid = find_pid_by_name(SHELLUI_PROC_NAME);
-  if (overlay_elf_blob_len == 0) {
-    log_line("overlay_elf not embedded — build third_party/overlay_elf and gen blob");
-    return;
-  }
-  if (pid > 0)
-    log_line("injecting overlay_elf into SceShellUI pid=%d (%u bytes)", pid,
-             overlay_elf_blob_len);
+  if (pid <= 0)
+    log_line("SceShellUI pid not found — overlay inject deferred");
   else
-    log_line("SceShellUI pid unknown — overlay via elfldr (%u bytes)",
+    log_line("overlay inject target SceShellUI pid=%d (%u bytes)", pid,
              overlay_elf_blob_len);
-  (void)inject_blob_to_pid(pid, overlay_elf_blob, overlay_elf_blob_len,
-                           "overlay_elf");
+  g_overlay_ok = inject_blob_to_pid(pid, overlay_elf_blob, overlay_elf_blob_len,
+                                   "overlay_elf");
 }
 
 static void setup_fps_overlay(void) {
-  /* Memory-only: inject embedded blobs. No /data writes for FPS/temps. */
-  setup_shellui_overlay();
+    setup_shellui_overlay();
 
-  if (fps_elf_blob_len == 0) {
-    log_line("fps_elf not embedded — build third_party/fps_elf and gen blob");
+  if (fps_elf_blob_len == 0)
     return;
-  }
   int game_pid = get_game_pid();
-  if (game_pid > 0)
-    log_line("injecting fps_elf into game pid=%d", game_pid);
   g_fps_injected = inject_blob_to_pid(game_pid, fps_elf_blob, fps_elf_blob_len,
                                      "fps_elf");
 }
@@ -615,29 +664,95 @@ static void pad_init_handles(void) {
 }
 
 static bool lightbar_window_active(void) {
+  if (!g_config.lightbar_enable)
+    return false;
+  if (g_config.lightbar_duration_sec <= 0)
+    return true; 
   uint64_t now = monotonic_seconds();
   if (g_start_sec == 0 || now < g_start_sec)
     return true;
-  return (now - g_start_sec) < (uint64_t)FANTARGET_LIGHTBAR_SEC;
+  return (now - g_start_sec) < (uint64_t)g_config.lightbar_duration_sec;
+}
+
+
+static void *lightbar_thread_main(void *arg) {
+  (void)arg;
+  ScePadLightBar color;
+  bool flash_off = false;
+  lightbar_band_t last = LB_NONE;
+
+  while (!g_lightbar_stop && !stop_requested) {
+    if (!g_config.lightbar_enable || !g_pad_ready) {
+      struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000000L };
+      nanosleep(&ts, NULL);
+      continue;
+    }
+    if (!lightbar_window_active()) {
+      struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000000L };
+      nanosleep(&ts, NULL);
+      continue;
+    }
+
+    int temp = atomic_load(&g_lightbar_temp);
+    lightbar_band_t band = band_from_temp(temp, last);
+    bool should_flash = g_config.lightbar_flash_on_red &&
+                        temp >= g_config.lightbar_flash_temp &&
+                        band == LB_RED;
+
+    if (should_flash) {
+      flash_off = !flash_off;
+      if (flash_off) {
+        color.r = color.g = color.b = 0;
+        color.reserved = 0;
+      } else {
+        band_to_rgb(LB_RED, &color);
+      }
+      for (int i = 0; i < g_pad_count; ++i) {
+        if (g_pad_handles[i] >= 0)
+          (void)scePadSetLightBar(g_pad_handles[i], &color);
+      }
+      last = LB_RED;
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 400000000L };
+      nanosleep(&ts, NULL);
+      continue;
+    }
+
+    flash_off = false;
+    if (band != last) {
+      band_to_rgb(band, &color);
+      for (int i = 0; i < g_pad_count; ++i) {
+        if (g_pad_handles[i] >= 0)
+          (void)scePadSetLightBar(g_pad_handles[i], &color);
+      }
+      last = band;
+    }
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000000L };
+    nanosleep(&ts, NULL);
+  }
+  return NULL;
+}
+
+static void lightbar_thread_start(void) {
+  if (g_lightbar_thread_started)
+    return;
+  g_lightbar_stop = 0;
+  if (pthread_create(&g_lightbar_thread, NULL, lightbar_thread_main, NULL) == 0)
+    g_lightbar_thread_started = 1;
+}
+
+static void lightbar_thread_stop(void) {
+  if (!g_lightbar_thread_started)
+    return;
+  g_lightbar_stop = 1;
+  (void)pthread_join(g_lightbar_thread, NULL);
+  g_lightbar_thread_started = 0;
 }
 
 static void pad_apply_lightbar(int system_temp) {
-  lightbar_band_t band;
-  ScePadLightBar color;
-
-  if (!g_pad_ready || !lightbar_window_active())
-    return;
-
-  band = band_from_temp(system_temp, g_last_band);
-  if (band == g_last_band)
-    return;
-
-  band_to_rgb(band, &color);
-  for (int i = 0; i < g_pad_count; ++i) {
-    if (g_pad_handles[i] >= 0)
-      (void)scePadSetLightBar(g_pad_handles[i], &color);
-  }
-  g_last_band = band;
+    if (system_temp >= 0)
+    atomic_store(&g_lightbar_temp, system_temp);
+  if (!g_lightbar_thread_started && g_config.lightbar_enable)
+    lightbar_thread_start();
 }
 
 static void log_line(const char *format, ...) {
@@ -652,6 +767,15 @@ static void log_line(const char *format, ...) {
   fputs(line, stdout);
   fflush(stdout);
   (void)sceKernelDebugOutText(0, line);
+}
+
+
+static void send_greeting_notification(void) {
+  notify_request_t req;
+  memset(&req, 0, sizeof(req));
+  snprintf(req.message, sizeof(req.message),
+           "Greetings by Issu.\n\nFan target %s", FAN_TARGET_VERSION);
+  (void)sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
 }
 
 static void on_signal(int signal_number) {
@@ -807,85 +931,6 @@ static int read_system_temp(const bool sensors[SOC_SENSOR_COUNT]) {
   return -1;
 }
 
-static void log_status(const bool sensors[SOC_SENSOR_COUNT],
-                       int current_target, int desired_target,
-                       int system_temp, int avg_temp, bool idle) {
-  int cpu = 0;
-  int cpu_rc = sceKernelGetCpuTemperature(&cpu);
-  int soc_max = 0;
-  int soc_max_id = -1;
-  unsigned soc_ok = 0;
-  uint16_t duty = 0;
-  uint64_t chassis = 0;
-  int duty_rc;
-  char cpu_text[24];
-  char soc_text[24];
-  char fan_text[24];
-  char target_text[56];
-  char avg_text[24];
-  char sys_text[24];
-  char fps_text[32];
-
-  for (unsigned sensor = 0; sensor < SOC_SENSOR_COUNT; ++sensor) {
-    int temperature = 0;
-    if (sensors[sensor] &&
-        sceKernelGetSocSensorTemperature((int)sensor, &temperature) == 0) {
-      if (soc_max_id < 0 || temperature > soc_max) {
-        soc_max = temperature;
-        soc_max_id = (int)sensor;
-      }
-      ++soc_ok;
-    }
-  }
-  duty_rc = sceKernelGetCurrentFanDuty(&duty, &chassis);
-
-  if (cpu_rc == 0)
-    (void)snprintf(cpu_text, sizeof(cpu_text), "%d C", cpu);
-  else
-    (void)snprintf(cpu_text, sizeof(cpu_text), "unavailable");
-
-  if (soc_max_id >= 0 && soc_ok > 0)
-    (void)snprintf(soc_text, sizeof(soc_text), "%d C", soc_max);
-  else
-    (void)snprintf(soc_text, sizeof(soc_text), "unavailable");
-
-  if (duty_rc == 0)
-    (void)snprintf(fan_text, sizeof(fan_text), "%.1f%%",
-                   (double)duty * 100.0 / 1024.0);
-  else
-    (void)snprintf(fan_text, sizeof(fan_text), "unavailable");
-
-  if (current_target >= 0) {
-    if (idle)
-      (void)snprintf(target_text, sizeof(target_text),
-                     "%d C (idle, not fighting)", current_target);
-    else
-      (void)snprintf(target_text, sizeof(target_text), "%d C (want %d C)",
-                     current_target, desired_target);
-  } else {
-    (void)snprintf(target_text, sizeof(target_text), "unavailable");
-  }
-
-  if (avg_temp >= 0)
-    (void)snprintf(avg_text, sizeof(avg_text), "%d C", avg_temp);
-  else
-    (void)snprintf(avg_text, sizeof(avg_text), "warming up");
-
-  if (system_temp >= 0)
-    (void)snprintf(sys_text, sizeof(sys_text), "%d C", system_temp);
-  else
-    (void)snprintf(sys_text, sizeof(sys_text), "n/a");
-
-  if (g_config.fps)
-    (void)snprintf(fps_text, sizeof(fps_text), "on");
-  else
-    (void)snprintf(fps_text, sizeof(fps_text), "off");
-
-  log_line("status CPU=%s, SoC=%s, fan=%s, target=%s, sys=%s, avg5m=%s, fps=%s%s",
-           cpu_text, soc_text, fan_text, target_text, sys_text, avg_text,
-           fps_text, idle ? " [IDLE]" : "");
-}
-
 static bool match_key(const char *line, const char *key, char *value,
                       size_t value_size) {
   const char *eq = strchr(line, '=');
@@ -935,6 +980,16 @@ static overlay_position_t parse_overlay_position(const char *value) {
   return OVERLAY_TOP_LEFT;
 }
 
+
+static bool parse_hex_color(const char *value, uint32_t *out) {
+  if (!value || !out) return false;
+  char *end = NULL;
+  unsigned long parsed = strtoul(value, &end, 16);
+  if (end == value) return false;
+  *out = (uint32_t)(parsed & 0xFFFFFFu);
+  return true;
+}
+
 static void init_default_config(void) {
   g_config.cpu_temp = true;
   g_config.gpu_temp = true;
@@ -942,7 +997,7 @@ static void init_default_config(void) {
   g_config.ram_usage = true;
   g_config.ssd_temp = true;
   g_config.fps = true;
-  g_config.fps_color = 0xFFB300u; /* amber/orange-yellow, reads well over gameplay */
+  g_config.fps_color = 0xFFB300u;
   g_config.metric = 'c';
   g_config.position = OVERLAY_TOP_LEFT;
   g_config.curve_count = 0;
@@ -950,6 +1005,35 @@ static void init_default_config(void) {
     g_config.curve_temps[i] = 0;
     g_config.curve_targets[i] = 0;
   }
+    g_config.temp_green_max = 50;
+  g_config.temp_yellow_max = 60;
+  g_config.temp_orange_max = 70;
+  g_config.temp_color_green = 0x33F24Du;
+  g_config.temp_color_yellow = 0xF2E626u;
+  g_config.temp_color_orange = 0xFF5C1Au;
+  g_config.temp_color_red = 0xFF261Fu;
+    g_config.fps_red_max = 24;
+  g_config.fps_yellow_max = 29;
+  g_config.fps_green_yellow_max = 45;
+  g_config.fps_color_red = 0xFF261Fu;
+  g_config.fps_color_yellow = 0xF2E626u;
+  g_config.fps_color_green_yellow = 0x8CF23Du;
+  g_config.fps_color_high = 0x26F2C2u; /* cyan-green, visible over gameplay */
+    g_config.fan_control = true;
+  g_config.lightbar_enable = true;
+  g_config.lightbar_duration_sec = 300;
+  g_config.lightbar_flash_on_red = true;
+  g_config.lightbar_flash_temp = 75;
+  g_config.lightbar_blue_max = 52;
+  g_config.lightbar_green_min = 55;
+  g_config.lightbar_green_max = 62;
+  g_config.lightbar_orange_min = 64;
+  g_config.lightbar_orange_max = 70;
+  g_config.lightbar_red_min = 72;
+  g_config.lightbar_color_blue = 0x0050FFu;
+  g_config.lightbar_color_green = 0x00DC28u;
+  g_config.lightbar_color_orange = 0xFF6400u;
+  g_config.lightbar_color_red = 0xFF0000u;
 }
 
 static bool parse_config_file(void) {
@@ -980,10 +1064,65 @@ static bool parse_config_file(void) {
     } else if (match_key(line, "fps", value, sizeof(value))) {
       g_config.fps = (value[0] == '1');
     } else if (match_key(line, "fps_color", value, sizeof(value))) {
-      char *end = NULL;
-      unsigned long parsed = strtoul(value, &end, 16);
-      if (end != value)
-        g_config.fps_color = (uint32_t)(parsed & 0xFFFFFFu);
+      parse_hex_color(value, &g_config.fps_color);
+    } else if (match_key(line, "temp_green_max", value, sizeof(value))) {
+      g_config.temp_green_max = atoi(value);
+    } else if (match_key(line, "temp_yellow_max", value, sizeof(value))) {
+      g_config.temp_yellow_max = atoi(value);
+    } else if (match_key(line, "temp_orange_max", value, sizeof(value))) {
+      g_config.temp_orange_max = atoi(value);
+    } else if (match_key(line, "temp_color_green", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.temp_color_green);
+    } else if (match_key(line, "temp_color_yellow", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.temp_color_yellow);
+    } else if (match_key(line, "temp_color_orange", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.temp_color_orange);
+    } else if (match_key(line, "temp_color_red", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.temp_color_red);
+    } else if (match_key(line, "fps_red_max", value, sizeof(value))) {
+      g_config.fps_red_max = atoi(value);
+    } else if (match_key(line, "fps_yellow_max", value, sizeof(value))) {
+      g_config.fps_yellow_max = atoi(value);
+    } else if (match_key(line, "fps_green_yellow_max", value, sizeof(value))) {
+      g_config.fps_green_yellow_max = atoi(value);
+    } else if (match_key(line, "fps_color_red", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.fps_color_red);
+    } else if (match_key(line, "fps_color_yellow", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.fps_color_yellow);
+    } else if (match_key(line, "fps_color_green_yellow", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.fps_color_green_yellow);
+    } else if (match_key(line, "fps_color_high", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.fps_color_high);
+    } else if (match_key(line, "fan_control", value, sizeof(value))) {
+      g_config.fan_control = (value[0] == '1');
+    } else if (match_key(line, "lightbar_enable", value, sizeof(value))) {
+      g_config.lightbar_enable = (value[0] == '1');
+    } else if (match_key(line, "lightbar_duration_sec", value, sizeof(value))) {
+      g_config.lightbar_duration_sec = atoi(value);
+    } else if (match_key(line, "lightbar_flash_on_red", value, sizeof(value))) {
+      g_config.lightbar_flash_on_red = (value[0] == '1');
+    } else if (match_key(line, "lightbar_flash_temp", value, sizeof(value))) {
+      g_config.lightbar_flash_temp = atoi(value);
+    } else if (match_key(line, "lightbar_blue_max", value, sizeof(value))) {
+      g_config.lightbar_blue_max = atoi(value);
+    } else if (match_key(line, "lightbar_green_min", value, sizeof(value))) {
+      g_config.lightbar_green_min = atoi(value);
+    } else if (match_key(line, "lightbar_green_max", value, sizeof(value))) {
+      g_config.lightbar_green_max = atoi(value);
+    } else if (match_key(line, "lightbar_orange_min", value, sizeof(value))) {
+      g_config.lightbar_orange_min = atoi(value);
+    } else if (match_key(line, "lightbar_orange_max", value, sizeof(value))) {
+      g_config.lightbar_orange_max = atoi(value);
+    } else if (match_key(line, "lightbar_red_min", value, sizeof(value))) {
+      g_config.lightbar_red_min = atoi(value);
+    } else if (match_key(line, "lightbar_color_blue", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.lightbar_color_blue);
+    } else if (match_key(line, "lightbar_color_green", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.lightbar_color_green);
+    } else if (match_key(line, "lightbar_color_orange", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.lightbar_color_orange);
+    } else if (match_key(line, "lightbar_color_red", value, sizeof(value))) {
+      parse_hex_color(value, &g_config.lightbar_color_red);
     } else {
       int index, temp, target;
       if (sscanf(line, "curve_%d=%d,%d", &index, &temp, &target) == 3) {
@@ -1010,27 +1149,75 @@ static bool write_default_config_file(void) {
   if (!file)
     return false;
   fprintf(file,
-          "# fan_target overlay config\n"
-          "# Set 1 to show, 0 to hide.\n"
+          "# fan_target_pxp config  (Fan target %s)\n"
+          "# Path: /data/fan_target_pxp/config.ini\n"
+          "#\n"
+          "# Overlay visibility (1=show, 0=hide)\n"
           "cpu_temp=1\n"
           "gpu_temp=1\n"
           "soc_temp=1\n"
           "ram_usage=1\n"
           "ssd_temp=1\n"
+          "fps=1\n"
           "metric=c\n"
           "overlay_position=top left\n"
-          "fps=1\n"
-          "# FPS overlay text colour, hex RRGGBB. Default is an amber/\n"
-          "# orange-yellow chosen to stay legible over most gameplay.\n"
+          "#\n"
+          "# === Temperature colour thresholds (°C) ===\n"
+          "# ≤ temp_green_max          → green\n"
+          "# ≤ temp_yellow_max         → yellow\n"
+          "# ≤ temp_orange_max         → orange\n"
+          "# >  temp_orange_max        → red\n"
+          "temp_green_max=50\n"
+          "temp_yellow_max=60\n"
+          "temp_orange_max=70\n"
+          "temp_color_green=33F24D\n"
+          "temp_color_yellow=F2E626\n"
+          "temp_color_orange=FF5C1A\n"
+          "temp_color_red=FF261F\n"
+          "#\n"
+          "# === FPS colour thresholds ===\n"
+          "# ≤ fps_red_max             → red\n"
+          "# ≤ fps_yellow_max          → yellow\n"
+          "# ≤ fps_green_yellow_max    → green-yellow\n"
+          "# >  fps_green_yellow_max   → cyan-green (high FPS)\n"
+          "fps_red_max=24\n"
+          "fps_yellow_max=29\n"
+          "fps_green_yellow_max=45\n"
+          "fps_color_red=FF261F\n"
+          "fps_color_yellow=F2E626\n"
+          "fps_color_green_yellow=8CF23D\n"
+          "fps_color_high=26F2C2\n"
+          "# legacy single fps_color (unused when band colours present)\n"
           "fps_color=FFB300\n"
-          "# Custom fan curve anchors: curve_<index>=<temp>,<target>\n"
+          "#\n"
+          "# === Fan curve anchors: curve_<n>=<temp_c>,<target_c> ===\n"
+          "# Target is the fan controller setpoint (°C). Lower = more aggressive.\n"
           "curve_0=40,91\n"
           "curve_1=52,88\n"
           "curve_2=58,84\n"
           "curve_3=64,75\n"
           "curve_4=70,72\n"
           "curve_5=75,70\n"
-          "curve_6=85,68\n");
+          "curve_6=85,68\n"
+          "#\n"
+          "# === Fan control (0 = overlays/lightbar/FPS only) ===\n"
+          "fan_control=1\n"
+          "# === Lightbar ===\n"
+          "lightbar_enable=1\n"
+          "lightbar_duration_sec=300\n"
+          "lightbar_flash_on_red=1\n"
+          "lightbar_flash_temp=75\n"
+          "lightbar_blue_max=52\n"
+          "lightbar_green_min=55\n"
+          "lightbar_green_max=62\n"
+          "lightbar_orange_min=64\n"
+          "lightbar_orange_max=70\n"
+          "lightbar_red_min=72\n"
+          "lightbar_color_blue=0050FF\n"
+          "lightbar_color_green=00DC28\n"
+          "lightbar_color_orange=FF6400\n"
+          "lightbar_color_red=FF0000\n",
+          FAN_TARGET_VERSION);
   fclose(file);
   return true;
 }
@@ -1046,48 +1233,269 @@ static bool ensure_config_directory(void) {
   return true;
 }
 
-static void apply_overlay_position(void) {
-  const char *pos_str = "top left";
-  int x = 0, y = 0;
-  switch (g_config.position) {
-  case OVERLAY_TOP_LEFT:
-    pos_str = "top left";
-    x = 20; y = 20;
-    break;
-  case OVERLAY_TOP_RIGHT:
-    pos_str = "top right";
-    x = 1740; y = 20;
-    break;
-  case OVERLAY_BOTTOM_LEFT:
-    pos_str = "bottom left";
-    x = 20; y = 980;
-    break;
-  case OVERLAY_BOTTOM_RIGHT:
-    pos_str = "bottom right";
-    x = 1740; y = 980;
-    break;
+
+static atomic_int g_config_reload_req;
+static pthread_t g_web_thread;
+static int g_web_thread_started;
+static volatile int g_web_stop;
+
+static void http_send(int fd, const char *status, const char *ctype, const char *body, size_t body_len) {
+  char hdr[256];
+  int n = snprintf(hdr, sizeof(hdr),
+                   "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                   "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                   status, ctype, body_len);
+  if (n > 0)
+    (void)send(fd, hdr, (size_t)n, 0);
+  if (body && body_len)
+    (void)send(fd, body, body_len, 0);
+}
+
+static int read_file_buf(const char *path, char *buf, size_t cap, size_t *out_len) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return -1;
+  size_t n = fread(buf, 1, cap - 1, f);
+  fclose(f);
+  buf[n] = '\0';
+  if (out_len)
+    *out_len = n;
+  return 0;
+}
+
+static int write_file_buf(const char *path, const char *buf, size_t len) {
+  FILE *f = fopen(path, "w");
+  if (!f)
+    return -1;
+  size_t n = fwrite(buf, 1, len, f);
+  fclose(f);
+  return n == len ? 0 : -1;
+}
+
+static int write_bytes(const char *path, const void *data, size_t len) {
+  FILE *f = fopen(path, "wb");
+  if (!f)
+    return -1;
+  size_t n = fwrite(data, 1, len, f);
+  fclose(f);
+  return n == len ? 0 : -1;
+}
+
+static int write_text(const char *path, const char *s) {
+  return write_bytes(path, s, strlen(s));
+}
+
+/* Media-tab home tile → browser deeplink to config UI (no PKG). */
+static void install_home_tile(void) {
+  char path[256];
+
+  mkdir("/user/app", 0755);
+  mkdir(APP_INSTALL_DIR, 0755);
+  mkdir(APP_SYS_DIR, 0755);
+
+  if (icon_blob_len > 0)
+    (void)write_bytes(APP_SYS_DIR "/icon0.png", icon_blob, icon_blob_len);
+  if (pic1_blob_len > 0)
+    (void)write_bytes(APP_SYS_DIR "/pic1.png", pic1_blob, pic1_blob_len);
+
+  {
+    char param[1024];
+    snprintf(param, sizeof(param),
+             "{\n"
+             "  \"titleId\": \"%s\",\n"
+             "  \"contentId\": \"IV9999-%s_00-FANTARGETPXP000\",\n"
+             "  \"contentVersion\": \"01.000.000\",\n"
+             "  \"masterVersion\": \"01.00\",\n"
+             "  \"applicationCategoryType\": %d,\n"
+             "  \"deeplinkUri\": \"http://127.0.0.1:%d/\",\n"
+             "  \"localizedParameters\": {\n"
+             "    \"defaultLanguage\": \"en-US\",\n"
+             "    \"en-US\": { \"titleName\": \"Fan Target\" }\n"
+             "  }\n"
+             "}\n",
+             TITLE_ID, TITLE_ID, APP_CATEGORY_MEDIA, WEBUI_PORT);
+    (void)write_text(APP_SYS_DIR "/param.json", param);
   }
-  log_line("overlay position set to: %s (x=%d, y=%d)", pos_str, x, y);
-  if ((void *)sceUserServiceSetGlsOverlayPosition != NULL) {
-    (void)sceUserServiceSetGlsOverlayPosition(x, y);
+
+  snprintf(path, sizeof(path), "%s/WEB_UI.txt", CONFIG_DIR);
+  {
+    char note[128];
+    snprintf(note, sizeof(note), "http://127.0.0.1:%d/\n", WEBUI_PORT);
+    (void)write_text(path, note);
+  }
+
+  {
+    int err = sceAppInstUtilInitialize();
+    if (err != 0) {
+      log_line("AppInstUtil init failed: 0x%08x", (unsigned)err);
+      return;
+    }
+    (void)sceAppInstUtilAppUnInstall(TITLE_ID);
+    err = sceAppInstUtilAppInstallTitleDir(TITLE_ID, "/user/app/", 0);
+    if (err == 0) {
+      log_line("home tile %s installed (Media)", TITLE_ID);
+      notify_request_t nreq;
+      memset(&nreq, 0, sizeof(nreq));
+      snprintf(nreq.message, sizeof(nreq.message),
+               "Fan Target tile installed\nMedia · %s", TITLE_ID);
+      (void)sceKernelSendNotificationRequest(0, &nreq, sizeof(nreq), 0);
+    } else {
+      log_line("home tile install failed: 0x%08x", (unsigned)err);
+    }
   }
 }
+
+static void handle_client(int cfd) {
+  char req[4096];
+  ssize_t n = recv(cfd, req, sizeof(req) - 1, 0);
+  if (n <= 0) {
+    close(cfd);
+    return;
+  }
+  req[n] = '\0';
+
+  char method[16], path[256];
+  method[0] = path[0] = '\0';
+  sscanf(req, "%15s %255s", method, path);
+
+  if (strcmp(method, "OPTIONS") == 0) {
+    http_send(cfd, "204 No Content", "text/plain", "", 0);
+    close(cfd);
+    return;
+  }
+
+  if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
+    http_send(cfd, "200 OK", "text/html; charset=utf-8", WEBUI_HTML, strlen(WEBUI_HTML));
+    close(cfd);
+    return;
+  }
+
+  if (strcmp(path, "/api/config") == 0 && strcmp(method, "GET") == 0) {
+    char body[16384];
+    size_t len = 0;
+    if (read_file_buf(CONFIG_FILE, body, sizeof(body), &len) != 0) {
+      const char *empty = "# no config yet\n";
+      http_send(cfd, "200 OK", "text/plain; charset=utf-8", empty, strlen(empty));
+    } else {
+      http_send(cfd, "200 OK", "text/plain; charset=utf-8", body, len);
+    }
+    close(cfd);
+    return;
+  }
+
+  if (strcmp(path, "/api/config") == 0 && strcmp(method, "POST") == 0) {
+    char *body = strstr(req, "\r\n\r\n");
+    if (!body) {
+      http_send(cfd, "400 Bad Request", "text/plain", "no body", 7);
+      close(cfd);
+      return;
+    }
+    body += 4;
+    size_t body_len = (size_t)(n - (body - req));
+    /* drain remaining if Content-Length larger */
+    const char *cl = strcasestr(req, "Content-Length:");
+    size_t want = body_len;
+    if (cl) {
+      want = (size_t)atoi(cl + 15);
+    }
+    char *acc = (char *)malloc(want + 1);
+    if (!acc) {
+      http_send(cfd, "500 Internal Server Error", "text/plain", "oom", 3);
+      close(cfd);
+      return;
+    }
+    size_t got = body_len;
+    if (got > want)
+      got = want;
+    memcpy(acc, body, got);
+    while (got < want) {
+      ssize_t r = recv(cfd, acc + got, want - got, 0);
+      if (r <= 0)
+        break;
+      got += (size_t)r;
+    }
+    acc[got] = '\0';
+    if (write_file_buf(CONFIG_FILE, acc, got) != 0) {
+      free(acc);
+      http_send(cfd, "500 Internal Server Error", "text/plain", "write failed", 12);
+      close(cfd);
+      return;
+    }
+    free(acc);
+    atomic_store(&g_config_reload_req, 1);
+    http_send(cfd, "200 OK", "text/plain", "ok", 2);
+    close(cfd);
+    return;
+  }
+
+  if (strcmp(path, "/api/reload") == 0 && strcmp(method, "POST") == 0) {
+    atomic_store(&g_config_reload_req, 1);
+    http_send(cfd, "200 OK", "text/plain", "ok", 2);
+    close(cfd);
+    return;
+  }
+
+  http_send(cfd, "404 Not Found", "text/plain", "not found", 9);
+  close(cfd);
+}
+
+static void *web_thread_main(void *arg) {
+  (void)arg;
+  int sfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sfd < 0)
+    return NULL;
+  int on = 1;
+  setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(WEBUI_PORT);
+  if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    close(sfd);
+    return NULL;
+  }
+  listen(sfd, 8);
+  while (!g_web_stop && !stop_requested) {
+    struct pollfd pfd = { .fd = sfd, .events = POLLIN };
+    int pr = poll(&pfd, 1, 500);
+    if (pr <= 0)
+      continue;
+    int cfd = accept(sfd, NULL, NULL);
+    if (cfd >= 0)
+      handle_client(cfd);
+  }
+  close(sfd);
+  return NULL;
+}
+
+static void web_thread_start(void) {
+  if (g_web_thread_started)
+    return;
+  g_web_stop = 0;
+  atomic_store(&g_config_reload_req, 0);
+  if (pthread_create(&g_web_thread, NULL, web_thread_main, NULL) == 0)
+    g_web_thread_started = 1;
+}
+
+static void web_thread_stop(void) {
+  if (!g_web_thread_started)
+    return;
+  g_web_stop = 1;
+  (void)pthread_join(g_web_thread, NULL);
+  g_web_thread_started = 0;
+}
+
 
 int main(void) {
   bool sensors[SOC_SENSOR_COUNT];
   struct sigaction action;
   int fan_fd = -1;
-  int last_target = -1;
   int last_applied_desired = -1;
   bool device_error_logged = false;
   bool correction_error_logged = false;
   bool idle = false;
-  bool idle_logged = false;
-  uint64_t next_log;
   unsigned pad_retry = 0;
-#if FANTARGET_SMOKE_LOOPS > 0
-  unsigned long loops = 0;
-#endif
 
   if (stop_old_instances() != 0)
     return 1;
@@ -1108,27 +1516,46 @@ int main(void) {
     if (!parse_config_file())
       (void)write_default_config_file();
   }
-  apply_overlay_position();
-  if (g_config.fps) {
+  if (g_config.fps || g_config.cpu_temp || g_config.gpu_temp ||
+      g_config.soc_temp || g_config.ram_usage || g_config.ssd_temp) {
     setup_fps_overlay();
   }
+  atomic_store(&g_lightbar_temp, -1);
   history_init(&g_history);
   discover_soc_sensors(sensors);
   g_start_sec = monotonic_seconds();
-  next_log = g_start_sec;
   pad_init_handles();
 
-  log_line("started; curve near-default when cool, idle enter<%d C exit>=%d C",
-           FANTARGET_IDLE_ENTER_C, FANTARGET_IDLE_EXIT_C);
-  log_line("poll=%d ms, history=%d s, log every %d s, lightbar %d s",
-           FANTARGET_POLL_MS, FANTARGET_HISTORY_SEC, FANTARGET_LOG_SECONDS,
-           FANTARGET_LIGHTBAR_SEC);
-  if (g_pad_ready)
-    log_line("lightbar ready (%d pad handle(s))", g_pad_count);
-  else
-    log_line("lightbar unavailable (no pad handles); fan control only");
+  install_home_tile();
+  web_thread_start();
+  send_greeting_notification();
+  log_line("fan_target %s started (fan_control=%d lightbar=%ds)",
+           FAN_TARGET_VERSION, g_config.fan_control,
+           g_config.lightbar_duration_sec);
 
   while (!stop_requested) {
+    if (atomic_exchange(&g_config_reload_req, 0)) {
+      init_default_config();
+      (void)parse_config_file();
+      log_line("config reloaded");
+    }
+    if (!g_overlay_ok && (g_config.fps || g_config.cpu_temp || g_config.gpu_temp ||
+                          g_config.soc_temp || g_config.ram_usage || g_config.ssd_temp)) {
+      static int overlay_retry_countdown;
+      if (++overlay_retry_countdown >= 5) {
+        overlay_retry_countdown = 0;
+        setup_shellui_overlay();
+      }
+    }
+    if (!g_fps_injected && g_config.fps) {
+      static int fps_retry_countdown;
+      if (++fps_retry_countdown >= 8) {
+        fps_retry_countdown = 0;
+        int gp = get_game_pid();
+        if (gp > 0)
+          g_fps_injected = inject_blob_to_pid(gp, fps_elf_blob, fps_elf_blob_len, "fps_elf");
+      }
+    }
     uint8_t config[FAN_CONFIG_SIZE];
     int current_target = -1;
     int system_temp = -1;
@@ -1168,89 +1595,49 @@ int main(void) {
       pad_close_all();
     }
 
-    if (fan_fd < 0) {
-      fan_fd = open(FAN_DEVICE, FAN_OPEN_FLAGS);
+    if (g_config.fan_control) {
       if (fan_fd < 0) {
-        if (!device_error_logged) {
-          log_line("fan controller is unavailable; retrying");
-          device_error_logged = true;
+        fan_fd = open(FAN_DEVICE, FAN_OPEN_FLAGS);
+        if (fan_fd < 0) {
+          if (!device_error_logged) {
+            log_line("fan controller unavailable");
+            device_error_logged = true;
+          }
+          goto wait_for_next_poll;
         }
+        device_error_logged = false;
+      }
+
+      if (get_fan_config(fan_fd, config) != 0) {
+        close(fan_fd);
+        fan_fd = -1;
         goto wait_for_next_poll;
       }
-      device_error_logged = false;
-    }
+      current_target = config[5];
 
-    if (get_fan_config(fan_fd, config) != 0) {
-      if (!device_error_logged) {
-        log_line("cannot read the target; reconnecting to the fan controller");
-        device_error_logged = true;
-      }
-      close(fan_fd);
-      fan_fd = -1;
-      goto wait_for_next_poll;
-    }
-    device_error_logged = false;
-    current_target = config[5];
-
-    if (last_target >= 0 && current_target != last_target)
-      log_line("target changed: %d C -> %d C", last_target, current_target);
-
-    if (idle) {
-      if (!idle_logged) {
-        log_line("idle (avg5m=%d C < %d C); leaving system target alone "
-                 "(exit when avg>=%d C)",
-                 avg_temp, FANTARGET_IDLE_ENTER_C, FANTARGET_IDLE_EXIT_C);
-        idle_logged = true;
-      }
-      correction_error_logged = false;
-    } else {
-      if (idle_logged) {
-        log_line("left idle (avg5m=%d C >= %d C); resuming curve control",
-                 avg_temp, FANTARGET_IDLE_EXIT_C);
-        idle_logged = false;
-      }
-      if (current_target != desired_target) {
+      if (!idle && current_target != desired_target) {
         uint8_t verified[FAN_CONFIG_SIZE];
-        int old_target = current_target;
-        if (set_target(fan_fd, config, (uint8_t)desired_target, verified) ==
-            0) {
+        if (set_target(fan_fd, config, (uint8_t)desired_target, verified) == 0) {
           current_target = verified[5];
           last_applied_desired = desired_target;
           correction_error_logged = false;
-          log_line("target set: %d C -> %d C (temp=%d C, avg5m=%d C, raw=%d C)",
-                   old_target, current_target, system_temp, avg_temp,
-                   raw_desired);
-        } else {
-          if (!correction_error_logged) {
-            log_line("cannot change target from %d C to %d C", old_target,
-                     desired_target);
-            correction_error_logged = true;
-          }
+        } else if (!correction_error_logged) {
+          log_line("fan target set failed (%d -> %d)", current_target, desired_target);
+          correction_error_logged = true;
           close(fan_fd);
           fan_fd = -1;
         }
-      } else {
+      } else if (!idle) {
         last_applied_desired = desired_target;
-        correction_error_logged = false;
       }
     }
 
-    last_target = current_target;
-
   wait_for_next_poll:
-    if (monotonic_seconds() >= next_log) {
-      log_status(sensors, current_target, desired_target, system_temp,
-                 avg_temp, idle);
-      next_log = monotonic_seconds() + FANTARGET_LOG_SECONDS;
-    }
-#if FANTARGET_SMOKE_LOOPS > 0
-    ++loops;
-    if (loops >= FANTARGET_SMOKE_LOOPS)
-      break;
-#endif
     sleep_poll_interval();
   }
 
+  web_thread_stop();
+  lightbar_thread_stop();
   pad_close_all();
   if (fan_fd >= 0)
     close(fan_fd);

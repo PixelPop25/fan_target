@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <cstdlib>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <strings.h>
 #include <unistd.h>
@@ -95,19 +97,45 @@ static OverlayConfig g_config;
 /* ---- colour thresholds (RGBA 0-1 for UIColor) ---- */
 struct rgba { float r, g, b, a; };
 
+/* Defaults match config.ini; overridden when load_config() reads the file */
+static int g_temp_green_max = 50;
+static int g_temp_yellow_max = 60;
+static int g_temp_orange_max = 70;
+static rgba g_temp_c_green = {0.20f, 0.95f, 0.30f, 1.0f};
+static rgba g_temp_c_yellow = {0.95f, 0.90f, 0.15f, 1.0f};
+static rgba g_temp_c_orange = {1.00f, 0.36f, 0.10f, 1.0f};
+static rgba g_temp_c_red = {1.00f, 0.15f, 0.12f, 1.0f};
+
+static int g_fps_red_max = 24;
+static int g_fps_yellow_max = 29;
+static int g_fps_gy_max = 45;
+static rgba g_fps_c_red = {1.00f, 0.15f, 0.12f, 1.0f};
+static rgba g_fps_c_yellow = {0.95f, 0.90f, 0.15f, 1.0f};
+static rgba g_fps_c_gy = {0.55f, 0.95f, 0.24f, 1.0f};
+static rgba g_fps_c_high = {0.15f, 0.95f, 0.76f, 1.0f}; /* cyan-green */
+
+static rgba hex_to_rgba(unsigned int hex) {
+  return {
+    ((hex >> 16) & 0xFF) / 255.0f,
+    ((hex >> 8) & 0xFF) / 255.0f,
+    (hex & 0xFF) / 255.0f,
+    1.0f
+  };
+}
+
 static rgba color_for_temp(int c) {
   if (c < 0) return {1.0f, 1.0f, 1.0f, 1.0f};
-  if (c <= 50) return {0.20f, 0.95f, 0.30f, 1.0f};   /* green */
-  if (c <= 60) return {0.95f, 0.90f, 0.15f, 1.0f};   /* yellow */
-  if (c <= 70) return {1.00f, 0.55f, 0.10f, 1.0f};   /* orange */
-  return {1.00f, 0.15f, 0.12f, 1.0f};                 /* red */
+  if (c <= g_temp_green_max) return g_temp_c_green;
+  if (c <= g_temp_yellow_max) return g_temp_c_yellow;
+  if (c <= g_temp_orange_max) return g_temp_c_orange;
+  return g_temp_c_red;
 }
 
 static rgba color_for_fps(double fps) {
-  if (fps >= 40.0) return {0.20f, 0.95f, 0.30f, 1.0f}; /* green */
-  if (fps >= 30.0) return {0.55f, 0.95f, 0.25f, 1.0f}; /* yellowish green */
-  if (fps >= 20.0) return {1.00f, 0.75f, 0.15f, 1.0f}; /* orangeish yellow */
-  return {1.00f, 0.15f, 0.12f, 1.0f};                   /* red */
+  if (fps <= (double)g_fps_red_max) return g_fps_c_red;
+  if (fps <= (double)g_fps_yellow_max) return g_fps_c_yellow;
+  if (fps <= (double)g_fps_gy_max) return g_fps_c_gy;
+  return g_fps_c_high;
 }
 
 static rgba color_for_ram(int pct) {
@@ -151,7 +179,7 @@ static int get_ram_usage_percent(void) {
 }
 
 static void load_config(void) {
-  FILE *f = fopen("/data/fan_target/config.ini", "r");
+  FILE *f = fopen("/data/fan_target_pxp/config.ini", "r");
   if (!f) return;
   char line[256];
   while (fgets(line, sizeof(line), f)) {
@@ -177,6 +205,20 @@ static void load_config(void) {
       else if (strcasecmp(val, "bottom right") == 0 || strcasecmp(val, "bottom-right") == 0) g_config.position = POS_BOTTOM_RIGHT;
       else g_config.position = POS_TOP_LEFT;
     }
+    else if (strcasecmp(key, "temp_green_max") == 0) g_temp_green_max = atoi(val);
+    else if (strcasecmp(key, "temp_yellow_max") == 0) g_temp_yellow_max = atoi(val);
+    else if (strcasecmp(key, "temp_orange_max") == 0) g_temp_orange_max = atoi(val);
+    else if (strcasecmp(key, "temp_color_green") == 0) g_temp_c_green = hex_to_rgba((unsigned)strtoul(val, nullptr, 16));
+    else if (strcasecmp(key, "temp_color_yellow") == 0) g_temp_c_yellow = hex_to_rgba((unsigned)strtoul(val, nullptr, 16));
+    else if (strcasecmp(key, "temp_color_orange") == 0) g_temp_c_orange = hex_to_rgba((unsigned)strtoul(val, nullptr, 16));
+    else if (strcasecmp(key, "temp_color_red") == 0) g_temp_c_red = hex_to_rgba((unsigned)strtoul(val, nullptr, 16));
+    else if (strcasecmp(key, "fps_red_max") == 0) g_fps_red_max = atoi(val);
+    else if (strcasecmp(key, "fps_yellow_max") == 0) g_fps_yellow_max = atoi(val);
+    else if (strcasecmp(key, "fps_green_yellow_max") == 0) g_fps_gy_max = atoi(val);
+    else if (strcasecmp(key, "fps_color_red") == 0) g_fps_c_red = hex_to_rgba((unsigned)strtoul(val, nullptr, 16));
+    else if (strcasecmp(key, "fps_color_yellow") == 0) g_fps_c_yellow = hex_to_rgba((unsigned)strtoul(val, nullptr, 16));
+    else if (strcasecmp(key, "fps_color_green_yellow") == 0) g_fps_c_gy = hex_to_rgba((unsigned)strtoul(val, nullptr, 16));
+    else if (strcasecmp(key, "fps_color_high") == 0) g_fps_c_high = hex_to_rgba((unsigned)strtoul(val, nullptr, 16));
   }
   fclose(f);
 }
@@ -558,9 +600,22 @@ static void *poll_thread(void *) {
 
 int main(int argc, const char **argv) {
   (void)argc; (void)argv;
-  if (!resolve_all()) {
-    for (;;) sleep(60);
+  /*
+   * Fix: retry until SceShellUI has Mono + PUI loaded.
+   *
+   * Previously this was:
+   *   if (!resolve_all()) { for (;;) sleep(60); }
+   * which silently hung forever whenever overlay_elf was injected before
+   * SceShellUI's Mono runtime / Sce.PlayStation.PUI.dll was ready (e.g.
+   * early in boot, or before the first game launch).
+   *
+   * Now we simply retry every 2 s until resolve_all() succeeds.  Once it
+   * does, Root_Domain and pui_img are valid and the widget threads can run.
+   */
+  while (!resolve_all()) {
+    sleep(2);
   }
+
   pthread_t th, poll;
   pthread_create(&th, nullptr, udp_thread, nullptr);
   pthread_create(&poll, nullptr, poll_thread, nullptr);

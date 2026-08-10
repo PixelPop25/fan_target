@@ -1,0 +1,61 @@
+# fan_target_pxp config (Fan target 1.0)
+# Runtime path: /data/fan_target_pxp/config.ini
+#
+# Overlay (1=show, 0=hide)
+cpu_temp=1
+gpu_temp=1
+soc_temp=1
+ram_usage=1
+ssd_temp=1
+fps=1
+metric=c
+overlay_position=top left
+#
+# Temperature colours (°C thresholds + RRGGBB)
+temp_green_max=50
+temp_yellow_max=60
+temp_orange_max=70
+temp_color_green=33F24D
+temp_color_yellow=F2E626
+temp_color_orange=FF5C1A
+temp_color_red=FF261F
+#
+# FPS colours
+fps_red_max=24
+fps_yellow_max=29
+fps_green_yellow_max=45
+fps_color_red=FF261F
+fps_color_yellow=F2E626
+fps_color_green_yellow=8CF23D
+fps_color_high=26F2C2
+fps_color=FFB300
+#
+# Fan curve: curve_n=<temp_c>,<target_c>
+curve_0=40,91
+curve_1=52,88
+curve_2=58,84
+curve_3=64,75
+curve_4=70,72
+curve_5=75,70
+curve_6=85,68
+#
+# fan_control=0 keeps overlays, FPS, and lightbar without touching the fan
+fan_control=1
+#
+# Lightbar (duration_sec=0 always on; default 300 = 5 minutes)
+lightbar_enable=1
+lightbar_duration_sec=300
+lightbar_flash_on_red=1
+lightbar_flash_temp=75
+lightbar_blue_max=52
+lightbar_green_min=55
+lightbar_green_max=62
+lightbar_orange_min=64
+lightbar_orange_max=70
+lightbar_red_min=72
+lightbar_color_blue=0050FF
+lightbar_color_green=00DC28
+lightbar_color_orange=FF6400
+lightbar_color_red=FF0000
+
+# Config UI: http://<PS5_IP>:25500/  (served by fan_target.elf)
